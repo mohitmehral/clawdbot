@@ -44,7 +44,7 @@ def _require_requests():
             requests = _r
         except ImportError:
             print("ERROR: 'requests' not installed. Run: pip install requests")
-            sys.exit(1)
+            return None
     return requests
 
 TFC_API = "https://app.terraform.io/api/v2"
@@ -3731,7 +3731,7 @@ def validate_s3_bucket_name(name):
         errors.append("Name must start/end with letter or number, only lowercase letters, numbers, hyphens, dots allowed")
     if '..' in name:
         errors.append("Name cannot contain consecutive dots")
-    if '--' in name:
+    if '--' in name and not re.match(r'^[a-z0-9]+--[a-z0-9]+', name):
         errors.append("Name cannot contain consecutive hyphens")
     if re.match(r'^\d+\.\d+\.\d+\.\d+$', name):
         errors.append("Name cannot be formatted as an IP address")
@@ -3981,7 +3981,7 @@ output "role_name" {{ value = aws_iam_role.this.name }}
         print(f"ERROR: Unknown resource type '{args.resource}'. Supported: s3, rg")
         sys.exit(1)
 
-    if _git_enabled():
+    if _git_enabled() and git_ok:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         _git_commit(f"generate: {args.resource} in {args.workspace} ({ts})")
         _git_push()
