@@ -2240,10 +2240,13 @@ output "audit_account_id"   {{ value = aws_organizations_account.audit.id }}
     print(f"   VPC baseline    : {'enabled (' + vpc_cidr + ')' if enable_vpc_baseline else 'disabled'}")
     print(f"   Account vending : {'enabled ($' + vending_budget + '/mo budget)' if enable_vending else 'disabled'}")
 
-def prompt_api_gateway(org, workspace, outdir):
-    """Interactively gather API Gateway REST API config with usage plans, API keys, and CloudWatch logging."""
+def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None):
+    """Generate API Gateway REST API config. Non-interactive when cli_name is provided."""
 
-    print("""
+    interactive = sys.stdin.isatty() and cli_name is None
+
+    if interactive:
+        print("""
 🌐 AWS API Gateway REST API Wizard
 ────────────────────────────────────────────────────────
 Creates a REST API Gateway with:
@@ -2256,69 +2259,56 @@ Creates a REST API Gateway with:
 
 Terraform Cloud workspace: plan only, no auto-apply.
 ────────────────────────────────────────────────────────""")
+        name   = prompt("API name (e.g. marsmovers-api)")
+        region = prompt("AWS region", default="us-east-1")
+        env    = prompt("Environment", default="prod", choices=["dev", "staging", "prod"])
+        description = prompt("API description", default=f"{name} REST API managed by OpenClaw")
+    else:
+        name = cli_name or "my-api"
+        region = cli_region or "us-east-1"
+        env = "prod"
+        description = f"{name} REST API managed by OpenClaw"
 
-    name   = prompt("API name (e.g. marsmovers-api)")
-    region = prompt("AWS region", default="us-east-1")
-    env    = prompt("Environment", default="prod", choices=["dev", "staging", "prod"])
-    description = prompt("API description", default=f"{name} REST API managed by OpenClaw")
-
-    # Stage
-    stage_name = prompt("Stage name", default=env)
-
-    # Throttling
-    print("\n  Usage plan throttling:")
-    rate_limit = prompt_num("Steady-state requests per second (TPS)", default=100, min_val=1)
-    burst_limit = prompt_num("Burst limit", default=50, min_val=1)
-    quota_limit = prompt_num("Monthly quota (requests, 0 = unlimited)", default=0, min_val=0, integer=True)
-
-    # API Key
-    print("\n  API Key:")
-    print("    Methods will require an API key by default (x-api-key header).")
-    api_key_name = prompt("API key name", default=f"{name}-key")
-
-    # CloudWatch logging
-    print("\n  CloudWatch logging:")
-    print("    1) ERROR — log errors only")
-    print("    2) INFO  — log all requests (recommended for debugging)")
-    log_level = prompt("Log level", default="2", choices=["1", "2"])
-    cw_log_level = "ERROR" if log_level == "1" else "INFO"
-    log_retention = prompt("Log retention (days)", default="30", choices=["7", "14", "30", "60", "90", "365"])
-
-    # Developer portal metadata
-    print("\n  Developer portal metadata:")
-    print("    Controls how this API appears in the API Gateway developer portal.")
-    print("    1) Private/internal — only visible to internal teams")
-    print("    2) Public product   — visible to external developers")
-    print("    3) Default allow    — all products behavior (portal shows all APIs)")
-    portal_choice = prompt("Portal visibility", default="1", choices=["1", "2", "3"])
-    portal_map = {"1": "private", "2": "public", "3": "allow-all"}
-    portal_visibility = portal_map[portal_choice]
-
-    # Backend integration placeholder
-    print("\n  Backend integration:")
-    print("    A MOCK integration is created as a placeholder.")
-    print("    TODO: Replace with your Lambda, HTTP, or VPC Link integration.")
-    resource_path = prompt("Root resource path (e.g. items, users)", default="items")
-
-    # Summary
-    print(f"""
-📋 Design Summary:
-   API name       : {name}
-   Stage          : {stage_name}
-   Throttle       : {rate_limit} TPS, burst {burst_limit}
-   Quota          : {'unlimited' if int(quota_limit) == 0 else quota_limit + '/month'}
-   API key        : {api_key_name} (required on all methods)
-   Client cert    : yes (attached to stage)
-   Logging        : CloudWatch {cw_log_level}, {log_retention} day retention
-   Portal         : {portal_visibility}
-   Resource       : /{resource_path} (MOCK — replace with real backend)
-   Region         : {region}
-   Workspace      : {workspace}
-""")
-    confirm = prompt("Proceed?", default="yes", choices=["yes", "no"])
-    if confirm != "yes":
-        print("Aborted.")
-        sys.exit(0)
+    if interactive:
+        stage_name = prompt("Stage name", default=env)
+        print("\n  Usage plan throttling:")
+        rate_limit = prompt_num("Steady-state requests per second (TPS)", default=100, min_val=1)
+        burst_limit = prompt_num("Burst limit", default=50, min_val=1)
+        quota_limit = prompt_num("Monthly quota (requests, 0 = unlimited)", default=0, min_val=0, integer=True)
+        print("\n  API Key:")
+        print("    Methods will require an API key by default (x-api-key header).")
+        api_key_name = prompt("API key name", default=f"{name}-key")
+        print("\n  CloudWatch logging:")
+        print("    1) ERROR — log errors only")
+        print("    2) INFO  — log all requests (recommended for debugging)")
+        log_level = prompt("Log level", default="2", choices=["1", "2"])
+        cw_log_level = "ERROR" if log_level == "1" else "INFO"
+        log_retention = prompt("Log retention (days)", default="30", choices=["7", "14", "30", "60", "90", "365"])
+        print("\n  Developer portal metadata:")
+        print("    1) Private/internal — only visible to internal teams")
+        print("    2) Public product   — visible to external developers")
+        print("    3) Default allow    — all products behavior (portal shows all APIs)")
+        portal_choice = prompt("Portal visibility", default="1", choices=["1", "2", "3"])
+        portal_map = {"1": "private", "2": "public", "3": "allow-all"}
+        portal_visibility = portal_map[portal_choice]
+        print("\n  Backend integration:")
+        print("    A MOCK integration is created as a placeholder.")
+        print("    TODO: Replace with your Lambda, HTTP, or VPC Link integration.")
+        resource_path = prompt("Root resource path (e.g. items, users)", default="items")
+        confirm = prompt("Proceed?", default="yes", choices=["yes", "no"])
+        if confirm != "yes":
+            print("Aborted.")
+            sys.exit(0)
+    else:
+        stage_name = env
+        rate_limit = "100"
+        burst_limit = "50"
+        quota_limit = "0"
+        api_key_name = f"{name}-key"
+        cw_log_level = "INFO"
+        log_retention = "30"
+        portal_visibility = "private"
+        resource_path = "items"
 
     # Quota block
     quota_block = ""
@@ -4260,7 +4250,7 @@ output "resource_group_id" {{ value = azurerm_resource_group.this.id }}
         prompt_iam_user(org, workspace, outdir)
 
     elif args.resource == "api-gateway":
-        prompt_api_gateway(org, workspace, outdir)
+        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region)
 
     elif args.resource == "iam-role":
         if not args.name:
