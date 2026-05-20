@@ -2240,6 +2240,343 @@ output "audit_account_id"   {{ value = aws_organizations_account.audit.id }}
     print(f"   VPC baseline    : {'enabled (' + vpc_cidr + ')' if enable_vpc_baseline else 'disabled'}")
     print(f"   Account vending : {'enabled ($' + vending_budget + '/mo budget)' if enable_vending else 'disabled'}")
 
+def prompt_api_gateway(org, workspace, outdir):
+    """Interactively gather API Gateway REST API config with usage plans, API keys, and CloudWatch logging."""
+
+    print("""
+🌐 AWS API Gateway REST API Wizard
+────────────────────────────────────────────────────────
+Creates a REST API Gateway with:
+  - Usage plan with throttling (100 TPS, burst 50)
+  - API key required by default
+  - Client certificate for backend auth
+  - CloudWatch execution logging
+  - Dedicated CloudWatch log group
+  - Developer portal metadata
+
+Terraform Cloud workspace: plan only, no auto-apply.
+────────────────────────────────────────────────────────""")
+
+    name   = prompt("API name (e.g. marsmovers-api)")
+    region = prompt("AWS region", default="us-east-1")
+    env    = prompt("Environment", default="prod", choices=["dev", "staging", "prod"])
+    description = prompt("API description", default=f"{name} REST API managed by OpenClaw")
+
+    # Stage
+    stage_name = prompt("Stage name", default=env)
+
+    # Throttling
+    print("\n  Usage plan throttling:")
+    rate_limit = prompt_num("Steady-state requests per second (TPS)", default=100, min_val=1)
+    burst_limit = prompt_num("Burst limit", default=50, min_val=1)
+    quota_limit = prompt_num("Monthly quota (requests, 0 = unlimited)", default=0, min_val=0, integer=True)
+
+    # API Key
+    print("\n  API Key:")
+    print("    Methods will require an API key by default (x-api-key header).")
+    api_key_name = prompt("API key name", default=f"{name}-key")
+
+    # CloudWatch logging
+    print("\n  CloudWatch logging:")
+    print("    1) ERROR — log errors only")
+    print("    2) INFO  — log all requests (recommended for debugging)")
+    log_level = prompt("Log level", default="2", choices=["1", "2"])
+    cw_log_level = "ERROR" if log_level == "1" else "INFO"
+    log_retention = prompt("Log retention (days)", default="30", choices=["7", "14", "30", "60", "90", "365"])
+
+    # Developer portal metadata
+    print("\n  Developer portal metadata:")
+    print("    Controls how this API appears in the API Gateway developer portal.")
+    print("    1) Private/internal — only visible to internal teams")
+    print("    2) Public product   — visible to external developers")
+    print("    3) Default allow    — all products behavior (portal shows all APIs)")
+    portal_choice = prompt("Portal visibility", default="1", choices=["1", "2", "3"])
+    portal_map = {"1": "private", "2": "public", "3": "allow-all"}
+    portal_visibility = portal_map[portal_choice]
+
+    # Backend integration placeholder
+    print("\n  Backend integration:")
+    print("    A MOCK integration is created as a placeholder.")
+    print("    TODO: Replace with your Lambda, HTTP, or VPC Link integration.")
+    resource_path = prompt("Root resource path (e.g. items, users)", default="items")
+
+    # Summary
+    print(f"""
+📋 Design Summary:
+   API name       : {name}
+   Stage          : {stage_name}
+   Throttle       : {rate_limit} TPS, burst {burst_limit}
+   Quota          : {'unlimited' if int(quota_limit) == 0 else quota_limit + '/month'}
+   API key        : {api_key_name} (required on all methods)
+   Client cert    : yes (attached to stage)
+   Logging        : CloudWatch {cw_log_level}, {log_retention} day retention
+   Portal         : {portal_visibility}
+   Resource       : /{resource_path} (MOCK — replace with real backend)
+   Region         : {region}
+   Workspace      : {workspace}
+""")
+    confirm = prompt("Proceed?", default="yes", choices=["yes", "no"])
+    if confirm != "yes":
+        print("Aborted.")
+        sys.exit(0)
+
+    # Quota block
+    quota_block = ""
+    if int(quota_limit) > 0:
+        quota_block = f"""
+  quota_settings {{
+    limit  = {quota_limit}
+    period = "MONTH"
+  }}
+"""
+
+    # Portal tags
+    portal_tags = ""
+    if portal_visibility == "private":
+        portal_tags = '    PortalVisibility = "internal"\n    PortalProduct = "private"'
+    elif portal_visibility == "public":
+        portal_tags = '    PortalVisibility = "external"\n    PortalProduct = "public"'
+    else:
+        portal_tags = '    PortalVisibility = "all"\n    PortalProduct = "allow-all"'
+
+    main_tf = f"""terraform {{
+  required_providers {{
+    aws = {{ source = "hashicorp/aws", version = "~> 5.0" }}
+  }}
+  cloud {{
+    organization = "{org}"
+    workspaces {{ name = "{workspace}" }}
+  }}
+}}
+
+provider "aws" {{ region = "{region}" }}
+
+locals {{
+  tags = {{
+    ManagedBy   = "terraform"
+    CreatedBy   = "openclaw"
+    Environment = "{env}"
+    Name        = "{name}"
+{portal_tags}
+  }}
+}}
+
+# ─── IAM Role for API Gateway CloudWatch Logging ───────────────────────────
+resource "aws_iam_role" "apigw_cloudwatch" {{
+  name = "{name}-apigw-cw-role"
+  assume_role_policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [{{
+      Effect    = "Allow"
+      Principal = {{ Service = "apigateway.amazonaws.com" }}
+      Action    = "sts:AssumeRole"
+    }}]
+  }})
+  tags = local.tags
+}}
+
+resource "aws_iam_role_policy_attachment" "apigw_cloudwatch" {{
+  role       = aws_iam_role.apigw_cloudwatch.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+}}
+
+resource "aws_api_gateway_account" "this" {{
+  cloudwatch_role_arn = aws_iam_role.apigw_cloudwatch.arn
+}}
+
+# ─── CloudWatch Log Group ──────────────────────────────────────────────────
+resource "aws_cloudwatch_log_group" "apigw" {{
+  name              = "/aws/apigateway/{name}"
+  retention_in_days = {log_retention}
+  tags              = local.tags
+}}
+
+# ─── REST API ──────────────────────────────────────────────────────────────
+resource "aws_api_gateway_rest_api" "this" {{
+  name        = "{name}"
+  description = "{description}"
+  tags        = local.tags
+
+  endpoint_configuration {{
+    types = ["REGIONAL"]
+  }}
+}}
+
+# ─── Client Certificate ────────────────────────────────────────────────────
+resource "aws_api_gateway_client_certificate" "this" {{
+  description = "Client certificate for {name} stage {stage_name}"
+  tags        = local.tags
+}}
+
+# ─── Resource + Method (MOCK — TODO: replace with real integration) ────────
+resource "aws_api_gateway_resource" "{resource_path}" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  parent_id   = aws_api_gateway_rest_api.this.root_resource_id
+  path_part   = "{resource_path}"
+}}
+
+resource "aws_api_gateway_method" "{resource_path}_get" {{
+  rest_api_id      = aws_api_gateway_rest_api.this.id
+  resource_id      = aws_api_gateway_resource.{resource_path}.id
+  http_method      = "GET"
+  authorization    = "NONE"
+  api_key_required = true  # API key enforced by default
+}}
+
+resource "aws_api_gateway_integration" "{resource_path}_get" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_get.http_method
+  type        = "MOCK"
+
+  request_templates = {{
+    "application/json" = jsonencode({{ statusCode = 200 }})
+  }}
+}}
+
+resource "aws_api_gateway_method_response" "{resource_path}_get_200" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_get.http_method
+  status_code = "200"
+}}
+
+resource "aws_api_gateway_integration_response" "{resource_path}_get_200" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_get.http_method
+  status_code = aws_api_gateway_method_response.{resource_path}_get_200.status_code
+
+  response_templates = {{
+    "application/json" = jsonencode({{ message = "TODO: connect real backend" }})
+  }}
+}}
+
+# ─── Deployment + Stage ────────────────────────────────────────────────────
+resource "aws_api_gateway_deployment" "this" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+
+  triggers = {{
+    redeployment = sha1(jsonencode([
+      aws_api_gateway_resource.{resource_path}.id,
+      aws_api_gateway_method.{resource_path}_get.id,
+      aws_api_gateway_integration.{resource_path}_get.id,
+    ]))
+  }}
+
+  lifecycle {{ create_before_destroy = true }}
+}}
+
+resource "aws_api_gateway_stage" "{stage_name}" {{
+  rest_api_id           = aws_api_gateway_rest_api.this.id
+  deployment_id         = aws_api_gateway_deployment.this.id
+  stage_name            = "{stage_name}"
+  client_certificate_id = aws_api_gateway_client_certificate.this.id
+
+  access_log_settings {{
+    destination_arn = aws_cloudwatch_log_group.apigw.arn
+    format         = jsonencode({{
+      requestId      = "$context.requestId"
+      ip             = "$context.identity.sourceIp"
+      caller         = "$context.identity.caller"
+      user           = "$context.identity.user"
+      requestTime    = "$context.requestTime"
+      httpMethod     = "$context.httpMethod"
+      resourcePath   = "$context.resourcePath"
+      status         = "$context.status"
+      protocol       = "$context.protocol"
+      responseLength = "$context.responseLength"
+    }})
+  }}
+
+  depends_on = [aws_api_gateway_account.this]
+  tags       = local.tags
+}}
+
+resource "aws_api_gateway_method_settings" "all" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  stage_name  = aws_api_gateway_stage.{stage_name}.stage_name
+  method_path = "*/*"
+
+  settings {{
+    logging_level      = "{cw_log_level}"
+    metrics_enabled    = true
+    data_trace_enabled = {str(cw_log_level == 'INFO').lower()}
+  }}
+}}
+
+# ─── Usage Plan + API Key ──────────────────────────────────────────────────
+resource "aws_api_gateway_usage_plan" "this" {{
+  name        = "{name}-usage-plan"
+  description = "Usage plan for {name}"
+
+  api_stages {{
+    api_id = aws_api_gateway_rest_api.this.id
+    stage  = aws_api_gateway_stage.{stage_name}.stage_name
+  }}
+
+  throttle_settings {{
+    rate_limit  = {rate_limit}
+    burst_limit = {burst_limit}
+  }}
+{quota_block}
+  tags = local.tags
+}}
+
+resource "aws_api_gateway_api_key" "this" {{
+  name    = "{api_key_name}"
+  enabled = true
+  tags    = local.tags
+}}
+
+resource "aws_api_gateway_usage_plan_key" "this" {{
+  key_id        = aws_api_gateway_api_key.this.id
+  key_type      = "API_KEY"
+  usage_plan_id = aws_api_gateway_usage_plan.this.id
+}}
+
+# ─── Outputs ───────────────────────────────────────────────────────────────
+output "api_id" {{
+  value = aws_api_gateway_rest_api.this.id
+}}
+
+output "api_invoke_url" {{
+  value = aws_api_gateway_stage.{stage_name}.invoke_url
+}}
+
+output "api_key_id" {{
+  value = aws_api_gateway_api_key.this.id
+}}
+
+output "api_key_value" {{
+  value     = aws_api_gateway_api_key.this.value
+  sensitive = true
+}}
+
+output "client_certificate_id" {{
+  value = aws_api_gateway_client_certificate.this.id
+}}
+
+output "cloudwatch_log_group" {{
+  value = aws_cloudwatch_log_group.apigw.name
+}}
+
+output "usage_plan_id" {{
+  value = aws_api_gateway_usage_plan.this.id
+}}
+"""
+    (outdir / "main.tf").write_text(main_tf)
+    print(f"\n✅ Generated {outdir}/main.tf for API Gateway '{name}'")
+    print(f"   Stage          : {stage_name}")
+    print(f"   Throttle       : {rate_limit} TPS, burst {burst_limit}")
+    print(f"   API key        : {api_key_name} (retrieve with: terraform output -raw api_key_value)")
+    print(f"   Client cert    : attached to stage")
+    print(f"   Logging        : {cw_log_level} → /aws/apigateway/{name}")
+    print(f"   Portal         : {portal_visibility}")
+    print(f"   ⚠️  MOCK integration on /{resource_path} — replace with real backend before deploy")
+    print(f"   Run: python3 tfc_client.py plan --dir {outdir}")
+
+
 def prompt_efs(org, workspace, outdir):
     """Interactively gather EFS config."""
 
@@ -3922,6 +4259,9 @@ output "resource_group_id" {{ value = azurerm_resource_group.this.id }}
     elif args.resource == "iam-user":
         prompt_iam_user(org, workspace, outdir)
 
+    elif args.resource == "api-gateway":
+        prompt_api_gateway(org, workspace, outdir)
+
     elif args.resource == "iam-role":
         if not args.name:
             print("ERROR: --name is required for iam-role resource.")
@@ -4192,7 +4532,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_gen = sub.add_parser("generate")
-    p_gen.add_argument("--resource", required=True, choices=["s3", "vpc", "ec2", "sg", "lambda", "iam-user", "budget", "cloudtrail", "cloudwatch", "efs", "landing-zone", "iam-role", "rg"])
+    p_gen.add_argument("--resource", required=True, choices=["s3", "vpc", "ec2", "sg", "lambda", "iam-user", "budget", "cloudtrail", "cloudwatch", "efs", "landing-zone", "iam-role", "api-gateway", "rg"])
     p_gen.add_argument("--name", required=False)
     p_gen.add_argument("--workspace", required=True)
     p_gen.add_argument("--dir", required=False, default=None)

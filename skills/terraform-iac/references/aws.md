@@ -133,6 +133,52 @@ resource "aws_lambda_function" "this" {
 }
 ```
 
+### API Gateway (REST)
+
+```hcl
+resource "aws_api_gateway_rest_api" "this" {
+  name        = var.api_name
+  description = "REST API"
+  tags        = local.tags
+
+  endpoint_configuration {
+    types = ["REGIONAL"]
+  }
+}
+
+resource "aws_api_gateway_usage_plan" "this" {
+  name = "${var.api_name}-plan"
+
+  api_stages {
+    api_id = aws_api_gateway_rest_api.this.id
+    stage  = aws_api_gateway_stage.this.stage_name
+  }
+
+  throttle_settings {
+    rate_limit  = 100
+    burst_limit = 50
+  }
+  tags = local.tags
+}
+
+resource "aws_api_gateway_api_key" "this" {
+  name    = "${var.api_name}-key"
+  enabled = true
+  tags    = local.tags
+}
+
+resource "aws_api_gateway_client_certificate" "this" {
+  description = "Client cert for backend auth"
+  tags        = local.tags
+}
+```
+
+> **Best practices:**
+> - Set `api_key_required = true` on methods to enforce key usage.
+> - Attach a client certificate to the stage for backend mutual TLS.
+> - Enable CloudWatch logging via `aws_api_gateway_method_settings` with `logging_level = "INFO"`.
+> - Create a dedicated log group `/aws/apigateway/<api-name>` for access logs.
+
 ### EKS Cluster
 
 ```hcl

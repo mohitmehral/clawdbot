@@ -46,9 +46,11 @@ python3 {baseDir}/scripts/tfc_client.py generate \
   --workspace prod-aws --dir /tmp/tf-aws
 ```
 
-Supported resources: `s3`, `vpc`, `ec2`, `sg`, `lambda`, `iam-user`, `iam-role`, `budget`, `cloudtrail`, `cloudwatch`, `efs`, `landing-zone`, `rg`
+Supported resources: `s3`, `vpc`, `ec2`, `sg`, `lambda`, `iam-user`, `iam-role`, `budget`, `cloudtrail`, `cloudwatch`, `efs`, `landing-zone`, `api-gateway`, `rg`
 
-Interactive wizards (vpc, ec2, sg, lambda, iam-user, budget, cloudtrail, cloudwatch, efs, landing-zone) will prompt for configuration with design guidance.
+Interactive wizards (vpc, ec2, sg, lambda, iam-user, budget, cloudtrail, cloudwatch, efs, landing-zone, api-gateway) will prompt for configuration with design guidance.
+
+**API Gateway:** The `api-gateway` wizard creates a REST API with usage plan throttling (100 TPS default, burst 50), API key required on all methods, client certificate attached to the stage, CloudWatch execution logging with a dedicated log group, and developer portal metadata (private/public/allow-all). A MOCK integration is generated as a placeholder — replace it with your Lambda or HTTP backend before deploying. Plans from the `prod-aws` workspace; does not auto-apply.
 
 **VPC CIDR requirement:** The VPC and landing-zone wizards derive /24 subnets from the provided CIDR using proper network arithmetic. The CIDR must be large enough to fit the required subnets (e.g. a /16 or /21 works; a /24 only yields one subnet and will be rejected if multiple AZs are requested).
 
