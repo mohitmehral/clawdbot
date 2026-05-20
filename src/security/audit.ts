@@ -1,19 +1,18 @@
 import path from "node:path";
+import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { resolveSandboxConfigForAgent } from "../agents/sandbox/config.js";
-import { hasPotentialConfiguredChannels } from "../channels/config-presence.js";
-import type { listChannelPlugins } from "../channels/plugins/index.js";
+import type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/config.js";
 import { resolveConfigPath, resolveStateDir } from "../config/paths.js";
-import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
+import type { SecurityAuditSuppression } from "../config/types.openclaw.js";
+import { isInterpreterLikeAllowlistPattern } from "../infra/command-analysis/inline-eval.js";
 import { type ExecApprovalsFile, loadExecApprovals } from "../infra/exec-approvals.js";
-import { isInterpreterLikeAllowlistPattern } from "../infra/exec-inline-eval.js";
 import {
   listInterpreterLikeSafeBins,
   resolveMergedSafeBinProfileFixtures,
 } from "../infra/exec-safe-bin-runtime-policy.js";
 import { listRiskyConfiguredSafeBins } from "../infra/exec-safe-bin-semantics.js";
 import { normalizeTrustedSafeBinDirs } from "../infra/exec-safe-bin-trust.js";
-import { getActivePluginRegistry } from "../plugins/runtime.js";
 import { DEFAULT_AGENT_ID } from "../routing/session-key.js";
 import { asNullableRecord } from "../shared/record-coerce.js";
 import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
@@ -28,10 +27,11 @@ import { collectGatewayConfigFindings as collectGatewayConfigFindingsBase } from
 import type {
   SecurityAuditFinding,
   SecurityAuditReport,
-  SecurityAuditSeverity,
   SecurityAuditSummary,
+  SecurityAuditSuppressedFinding,
 } from "./audit.types.js";
 import { collectEnabledInsecureOrDangerousFlags } from "./dangerous-config-flags.js";
+import { collectExecFilesystemPolicyDriftHits } from "./exec-filesystem-policy.js";
 import type { ExecFn } from "./windows-acl.js";
 
 type ExecDockerRawFn = typeof import("../agents/sandbox/docker.js").execDockerRaw;
@@ -59,7 +59,9 @@ export type SecurityAuditOptions = {
   /** Time limit for deep gateway probe. */
   deepTimeoutMs?: number;
   /** Dependency injection for tests. */
-  plugins?: ReturnType<typeof listChannelPlugins>;
+  plugins?: ChannelPlugin[];
+  /** Whether to import plugin modules to discover plugin security audit collectors. */
+  loadPluginSecurityCollectors?: boolean;
   /** Dependency injection for tests (Windows ACL checks). */
   execIcacls?: ExecFn;
   /** Dependency injection for tests (Docker label checks). */
@@ -70,11 +72,13 @@ export type SecurityAuditOptions = {
   codeSafetySummaryCache?: Map<string, Promise<unknown>>;
   /** Optional explicit auth for deep gateway probe. */
   deepProbeAuth?: { token?: string; password?: string };
+  /** Override workspace used for workspace plugin discovery. */
+  workspaceDir?: string;
   /** Dependency injection for tests. */
   probeGatewayFn?: ProbeGatewayFn;
 };
 
-type AuditExecutionContext = {
+export type AuditExecutionContext = {
   cfg: OpenClawConfig;
   sourceConfig: OpenClawConfig;
   env: NodeJS.ProcessEnv;
@@ -88,23 +92,31 @@ type AuditExecutionContext = {
   execIcacls?: ExecFn;
   execDockerRawFn?: ExecDockerRawFn;
   probeGatewayFn?: ProbeGatewayFn;
-  plugins?: ReturnType<typeof listChannelPlugins>;
+  plugins?: ChannelPlugin[];
+  loadPluginSecurityCollectors: boolean;
   configSnapshot: ConfigFileSnapshot | null;
   codeSafetySummaryCache: Map<string, Promise<unknown>>;
   deepProbeAuth?: { token?: string; password?: string };
+  workspaceDir?: string;
 };
 
-let channelPluginsModulePromise: Promise<typeof import("../channels/plugins/index.js")> | undefined;
+let readOnlyChannelPluginsModulePromise:
+  | Promise<typeof import("../channels/plugins/read-only.js")>
+  | undefined;
 let auditNonDeepModulePromise: Promise<typeof import("./audit.nondeep.runtime.js")> | undefined;
 let auditChannelModulePromise:
   | Promise<typeof import("./audit-channel.collect.runtime.js")>
   | undefined;
-let pluginRegistryLoaderModulePromise:
-  | Promise<typeof import("../plugins/runtime/runtime-registry-loader.js")>
-  | undefined;
 let pluginMetadataRegistryLoaderModulePromise:
   | Promise<typeof import("../plugins/runtime/metadata-registry-loader.js")>
   | undefined;
+let pluginAutoEnableModulePromise:
+  | Promise<typeof import("../config/plugin-auto-enable.js")>
+  | undefined;
+let channelPluginIdsModulePromise:
+  | Promise<typeof import("../plugins/channel-plugin-ids.js")>
+  | undefined;
+let pluginRuntimeModulePromise: Promise<typeof import("../plugins/runtime.js")> | undefined;
 let gatewayProbeDepsPromise:
   | Promise<{
       buildGatewayConnectionDetails: typeof import("../gateway/call.js").buildGatewayConnectionDetails;
@@ -114,9 +126,9 @@ let gatewayProbeDepsPromise:
     }>
   | undefined;
 
-async function loadChannelPlugins() {
-  channelPluginsModulePromise ??= import("../channels/plugins/index.js");
-  return await channelPluginsModulePromise;
+async function loadReadOnlyChannelPlugins() {
+  readOnlyChannelPluginsModulePromise ??= import("../channels/plugins/read-only.js");
+  return await readOnlyChannelPluginsModulePromise;
 }
 
 async function loadAuditNonDeepModule() {
@@ -129,15 +141,25 @@ async function loadAuditChannelModule() {
   return await auditChannelModulePromise;
 }
 
-async function loadPluginRegistryLoaderModule() {
-  pluginRegistryLoaderModulePromise ??= import("../plugins/runtime/runtime-registry-loader.js");
-  return await pluginRegistryLoaderModulePromise;
-}
-
 async function loadPluginMetadataRegistryLoaderModule() {
   pluginMetadataRegistryLoaderModulePromise ??=
     import("../plugins/runtime/metadata-registry-loader.js");
   return await pluginMetadataRegistryLoaderModulePromise;
+}
+
+async function loadPluginAutoEnableModule() {
+  pluginAutoEnableModulePromise ??= import("../config/plugin-auto-enable.js");
+  return await pluginAutoEnableModulePromise;
+}
+
+async function loadChannelPluginIdsModule() {
+  channelPluginIdsModulePromise ??= import("../plugins/channel-plugin-ids.js");
+  return await channelPluginIdsModulePromise;
+}
+
+async function loadPluginRuntimeModule() {
+  pluginRuntimeModulePromise ??= import("../plugins/runtime.js");
+  return await pluginRuntimeModulePromise;
 }
 
 async function loadGatewayProbeDeps() {
@@ -168,6 +190,71 @@ function countBySeverity(findings: SecurityAuditFinding[]): SecurityAuditSummary
     }
   }
   return { critical, warn, info };
+}
+
+function normalizeSuppressionText(value: string | undefined): string {
+  return (value ?? "").trim().toLowerCase();
+}
+
+function findingMatchesSuppression(
+  finding: SecurityAuditFinding,
+  suppression: SecurityAuditSuppression,
+): boolean {
+  const checkId = suppression.checkId.trim();
+  if (!checkId || finding.checkId !== checkId) {
+    return false;
+  }
+  const titleNeedle = normalizeSuppressionText(suppression.titleIncludes);
+  if (titleNeedle && !finding.title.toLowerCase().includes(titleNeedle)) {
+    return false;
+  }
+  const detailNeedle = normalizeSuppressionText(suppression.detailIncludes);
+  if (detailNeedle && !finding.detail.toLowerCase().includes(detailNeedle)) {
+    return false;
+  }
+  return true;
+}
+
+function buildSecurityAuditSuppressionsActiveFinding(params: {
+  configuredCount: number;
+  suppressedCount: number;
+}): SecurityAuditFinding {
+  return {
+    checkId: "security.audit.suppressions.active",
+    severity: "info",
+    title: "Security audit suppressions configured",
+    detail:
+      `security.audit.suppressions has ${params.configuredCount} configured suppression(s); ` +
+      `${params.suppressedCount} finding(s) moved to suppressedFindings.`,
+    remediation:
+      "Review suppressedFindings and remove suppressions when the accepted risk no longer applies.",
+  };
+}
+
+export function applySecurityAuditSuppressions(
+  findings: SecurityAuditFinding[],
+  suppressions: SecurityAuditSuppression[] | undefined,
+): { findings: SecurityAuditFinding[]; suppressedFindings: SecurityAuditSuppressedFinding[] } {
+  if (!Array.isArray(suppressions) || suppressions.length === 0) {
+    return { findings, suppressedFindings: [] };
+  }
+  const active: SecurityAuditFinding[] = [];
+  const suppressedFindings: SecurityAuditSuppressedFinding[] = [];
+  for (const finding of findings) {
+    const suppression = suppressions.find((candidate) =>
+      findingMatchesSuppression(finding, candidate),
+    );
+    if (!suppression) {
+      active.push(finding);
+      continue;
+    }
+    const reason = suppression.reason?.trim();
+    suppressedFindings.push({
+      ...finding,
+      suppression: reason ? { reason } : {},
+    });
+  }
+  return { findings: active, suppressedFindings };
 }
 
 function normalizeAllowFromList(list: Array<string | number> | undefined | null): string[] {
@@ -318,11 +405,16 @@ export function collectGatewayConfigFindings(
   });
 }
 
-async function collectPluginSecurityAuditFindings(
+export async function collectPluginSecurityAuditFindings(
   context: AuditExecutionContext,
 ): Promise<SecurityAuditFinding[]> {
+  if (!context.loadPluginSecurityCollectors) {
+    return [];
+  }
+  const { getActivePluginRegistry } = await loadPluginRuntimeModule();
   let collectors = getActivePluginRegistry()?.securityAuditCollectors ?? [];
   if (collectors.length === 0) {
+    const { applyPluginAutoEnable } = await loadPluginAutoEnableModule();
     const autoEnabled = applyPluginAutoEnable({
       config: context.sourceConfig,
       env: context.env,
@@ -352,6 +444,20 @@ async function collectPluginSecurityAuditFindings(
         requestedPluginIds.add(normalized);
       }
     }
+    if (context.includeChannelSecurity && context.plugins !== undefined) {
+      const { resolveConfiguredChannelPluginIds } = await loadChannelPluginIdsModule();
+      const auditedChannelPluginIds = new Set(context.plugins.map((plugin) => plugin.id));
+      for (const pluginId of resolveConfiguredChannelPluginIds({
+        config: autoEnabled.config,
+        activationSourceConfig: context.sourceConfig,
+        workspaceDir: context.workspaceDir,
+        env: context.env,
+      })) {
+        if (auditedChannelPluginIds.has(pluginId)) {
+          requestedPluginIds.delete(pluginId);
+        }
+      }
+    }
     if (requestedPluginIds.size === 0) {
       return [];
     }
@@ -361,6 +467,7 @@ async function collectPluginSecurityAuditFindings(
       config: autoEnabled.config,
       activationSourceConfig: context.sourceConfig,
       env: context.env,
+      workspaceDir: context.workspaceDir,
       onlyPluginIds: [...requestedPluginIds],
     });
     collectors = snapshot.securityAuditCollectors ?? [];
@@ -538,6 +645,20 @@ export function collectExecRuntimeFindings(cfg: OpenClawConfig): SecurityAuditFi
         `Exec-enabled scopes:\n${execEnabledScopes.map((entry) => `- ${entry.id}: security=${entry.security}, host=${entry.host}`).join("\n")}`,
       remediation:
         "Tighten dmPolicy/groupPolicy to pairing or allowlist, or disable exec for agents reachable from shared/public channels.",
+    });
+  }
+
+  const execFilesystemPolicyHits = collectExecFilesystemPolicyDriftHits(cfg);
+  if (execFilesystemPolicyHits.length > 0) {
+    findings.push({
+      checkId: "tools.exec.fs_tools_disabled_but_exec_enabled",
+      severity: "warn",
+      title: "Filesystem tool policy does not make exec read-only",
+      detail:
+        `Found scopes where write/edit/apply_patch are unavailable but exec remains available:\n${execFilesystemPolicyHits.map((hit) => `- ${hit.scopeLabel}: runtime=[${hit.runtimeTools.join(", ")}], disabledFs=[${hit.disabledFilesystemTools.join(", ")}], exec.host=${hit.execHost}, sandbox=${hit.sandboxMode}, workspaceAccess=${hit.sandboxWorkspaceAccess}`).join("\n")}\n` +
+        "The exec tool is a shell and can still write files wherever the selected host or sandbox filesystem permits it.",
+      remediation:
+        'For read-only agents, deny exec and process too. If shell access is intentional, constrain the filesystem boundary with sandbox mode "all" and workspaceAccess "ro" or "none".',
     });
   }
 
@@ -883,6 +1004,8 @@ async function createAuditExecutionContext(
   const deepTimeoutMs = Math.max(250, opts.deepTimeoutMs ?? 5000);
   const stateDir = opts.stateDir ?? resolveStateDir(env);
   const configPath = opts.configPath ?? resolveConfigPath(env, stateDir);
+  const workspaceDir =
+    opts.workspaceDir ?? resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg));
   const { readConfigSnapshotForAudit } = await loadAuditNonDeepModule();
   const configSnapshot = includeFilesystem
     ? opts.configSnapshot !== undefined
@@ -904,6 +1027,8 @@ async function createAuditExecutionContext(
     execDockerRawFn: opts.execDockerRawFn,
     probeGatewayFn: opts.probeGatewayFn,
     plugins: opts.plugins,
+    loadPluginSecurityCollectors: opts.loadPluginSecurityCollectors ?? deep,
+    workspaceDir,
     configSnapshot,
     codeSafetySummaryCache: opts.codeSafetySummaryCache ?? new Map<string, Promise<unknown>>(),
     deepProbeAuth: opts.deepProbeAuth,
@@ -984,19 +1109,39 @@ export async function runSecurityAudit(opts: SecurityAuditOptions): Promise<Secu
     );
   }
 
-  const shouldAuditChannelSecurity =
-    context.includeChannelSecurity &&
-    (context.plugins !== undefined || hasPotentialConfiguredChannels(cfg, env));
-  if (shouldAuditChannelSecurity) {
-    if (context.plugins === undefined) {
-      (await loadPluginRegistryLoaderModule()).ensurePluginRegistryLoaded({
-        scope: "configured-channels",
-        config: cfg,
-        activationSourceConfig: context.sourceConfig,
-        env,
-      });
+  let shouldAuditChannelSecurity = false;
+  if (context.includeChannelSecurity) {
+    if (context.plugins !== undefined) {
+      shouldAuditChannelSecurity = true;
+    } else {
+      const { hasConfiguredChannelsForReadOnlyScope, resolveConfiguredChannelPluginIds } =
+        await loadChannelPluginIdsModule();
+      shouldAuditChannelSecurity =
+        hasConfiguredChannelsForReadOnlyScope({
+          config: cfg,
+          activationSourceConfig: context.sourceConfig,
+          workspaceDir: context.workspaceDir,
+          env,
+        }) ||
+        resolveConfiguredChannelPluginIds({
+          config: cfg,
+          activationSourceConfig: context.sourceConfig,
+          workspaceDir: context.workspaceDir,
+          env,
+        }).length > 0;
     }
-    const channelPlugins = context.plugins ?? (await loadChannelPlugins()).listChannelPlugins();
+  }
+  if (shouldAuditChannelSecurity) {
+    const channelPlugins =
+      context.plugins ??
+      (await loadReadOnlyChannelPlugins()).listReadOnlyChannelPluginsForConfig(cfg, {
+        activationSourceConfig: context.sourceConfig,
+        workspaceDir: context.workspaceDir,
+        env,
+        stateDir,
+        includePersistedAuthState: true,
+        includeSetupFallbackPlugins: true,
+      });
     const { collectChannelSecurityFindings } = await loadAuditChannelModule();
     findings.push(
       ...(await collectChannelSecurityFindings({
@@ -1019,6 +1164,27 @@ export async function runSecurityAudit(opts: SecurityAuditOptions): Promise<Secu
   const deep = deepProbeResult?.deep;
   findings.push(...collectDeepProbeFindings({ deep, authWarning: deepProbeResult?.authWarning }));
 
-  const summary = countBySeverity(findings);
-  return { ts: Date.now(), summary, findings, deep };
+  const configuredSuppressions = cfg.security?.audit?.suppressions;
+  const filtered = applySecurityAuditSuppressions(findings, configuredSuppressions);
+  const configuredSuppressionCount = configuredSuppressions?.length ?? 0;
+  const activeFindings =
+    configuredSuppressionCount > 0
+      ? [
+          ...filtered.findings,
+          buildSecurityAuditSuppressionsActiveFinding({
+            configuredCount: configuredSuppressionCount,
+            suppressedCount: filtered.suppressedFindings.length,
+          }),
+        ]
+      : filtered.findings;
+  const summary = countBySeverity(activeFindings);
+  return {
+    ts: Date.now(),
+    summary,
+    findings: activeFindings,
+    ...(filtered.suppressedFindings.length > 0
+      ? { suppressedFindings: filtered.suppressedFindings }
+      : {}),
+    deep,
+  };
 }

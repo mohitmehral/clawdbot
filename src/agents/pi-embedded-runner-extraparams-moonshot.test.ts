@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runExtraParamsPayloadCase } from "./pi-embedded-runner-extraparams.test-support.js";
-import { __testing as extraParamsTesting } from "./pi-embedded-runner/extra-params.js";
+import { testing as extraParamsTesting } from "./pi-embedded-runner/extra-params.js";
 import {
   createMoonshotThinkingWrapper,
   resolveMoonshotThinkingKeep,
@@ -10,6 +10,7 @@ import {
 beforeEach(() => {
   extraParamsTesting.setProviderRuntimeDepsForTest({
     prepareProviderExtraParams: ({ context }) => context.extraParams,
+    resolveProviderExtraParamsForTransport: () => undefined,
     wrapProviderStreamFn: (params) => {
       if (params.provider === "moonshot") {
         const thinkingType = resolveMoonshotThinkingType({

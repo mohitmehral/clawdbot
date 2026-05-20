@@ -7,11 +7,9 @@ read_when:
 title: "Moonshot AI"
 ---
 
-# Moonshot AI (Kimi)
-
 Moonshot provides the Kimi API with OpenAI-compatible endpoints. Configure the
 provider and set the default model to `moonshot/kimi-k2.6`, or use
-Kimi Coding with `kimi/kimi-code`.
+Kimi Coding with `kimi/kimi-for-coding`.
 
 <Warning>
 Moonshot and Kimi Coding are **separate providers**. Keys are not interchangeable, endpoints differ, and model refs differ (`moonshot/...` vs `kimi/...`).
@@ -187,7 +185,7 @@ Choose your provider and follow the setup steps.
     **Best for:** code-focused tasks via the Kimi Coding endpoint.
 
     <Note>
-    Kimi Coding uses a different API key and provider prefix (`kimi/...`) than Moonshot (`moonshot/...`). Legacy model ref `kimi/k2p5` remains accepted as a compatibility id.
+    Kimi Coding uses a different API key and provider prefix (`kimi/...`) than Moonshot (`moonshot/...`). The stable API model ref is `kimi/kimi-for-coding`; legacy refs `kimi/kimi-code` and `kimi/k2p5` remain accepted and normalize to that API model id.
     </Note>
 
     <Steps>
@@ -201,7 +199,7 @@ Choose your provider and follow the setup steps.
         {
           agents: {
             defaults: {
-              model: { primary: "kimi/kimi-code" },
+              model: { primary: "kimi/kimi-for-coding" },
             },
           },
         }
@@ -221,9 +219,9 @@ Choose your provider and follow the setup steps.
       env: { KIMI_API_KEY: "sk-..." },
       agents: {
         defaults: {
-          model: { primary: "kimi/kimi-code" },
+          model: { primary: "kimi/kimi-for-coding" },
           models: {
-            "kimi/kimi-code": { alias: "Kimi" },
+            "kimi/kimi-for-coding": { alias: "Kimi" },
           },
         },
       },
@@ -286,7 +284,7 @@ Config lives under `plugins.entries.moonshot.config.webSearch`:
 }
 ```
 
-## Advanced
+## Advanced configuration
 
 <AccordionGroup>
   <Accordion title="Native thinking mode">
@@ -348,6 +346,26 @@ Config lives under `plugins.entries.moonshot.config.webSearch`:
 
   </Accordion>
 
+  <Accordion title="Tool call id sanitization">
+    Moonshot Kimi serves tool_call ids shaped like `functions.<name>:<index>`. OpenClaw preserves them unchanged so multi-turn tool calls keep working.
+
+    To force strict sanitization on a custom OpenAI-compatible provider, set `sanitizeToolCallIds: true`:
+
+    ```json5
+    {
+      models: {
+        providers: {
+          "my-kimi-proxy": {
+            api: "openai-completions",
+            sanitizeToolCallIds: true,
+          },
+        },
+      },
+    }
+    ```
+
+  </Accordion>
+
   <Accordion title="Streaming usage compatibility">
     Native Moonshot endpoints (`https://api.moonshot.ai/v1` and
     `https://api.moonshot.cn/v1`) advertise streaming usage compatibility on the
@@ -383,7 +401,7 @@ Config lives under `plugins.entries.moonshot.config.webSearch`:
   <Card title="Model selection" href="/concepts/model-providers" icon="layers">
     Choosing providers, model refs, and failover behavior.
   </Card>
-  <Card title="Web search" href="/tools/web-search" icon="magnifying-glass">
+  <Card title="Web search" href="/tools/web" icon="magnifying-glass">
     Configuring web search providers including Kimi.
   </Card>
   <Card title="Configuration reference" href="/gateway/configuration-reference" icon="gear">

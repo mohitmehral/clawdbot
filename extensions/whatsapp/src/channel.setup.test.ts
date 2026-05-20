@@ -1,10 +1,9 @@
+import { createQueuedWizardPrompter } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/routing";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createQueuedWizardPrompter } from "../../../test/helpers/plugins/setup-wizard.js";
-import { whatsappApprovalAuth } from "./approval-auth.js";
 import { WHATSAPP_AUTH_UNSTABLE_CODE } from "./auth-store.js";
-import { whatsappPlugin } from "./channel.js";
+import { whatsappSetupPlugin } from "./channel.setup.js";
 import { checkWhatsAppHeartbeatReady } from "./heartbeat.js";
 import type { OpenClawConfig } from "./runtime-api.js";
 import { finalizeWhatsAppSetup } from "./setup-finalize.js";
@@ -39,6 +38,17 @@ const hoisted = vi.hoisted(() => ({
   })),
 }));
 
+function splitSetupEntriesForMock(raw: string): string[] {
+  const entries: string[] = [];
+  for (const entry of raw.split(",")) {
+    const normalized = entry.trim();
+    if (normalized.length > 0) {
+      entries.push(normalized);
+    }
+  }
+  return entries;
+}
+
 vi.mock("./login.js", () => ({
   loginWeb: hoisted.loginWeb,
 }));
@@ -59,16 +69,19 @@ vi.mock("openclaw/plugin-sdk/setup", async () => {
     ...actual,
     DEFAULT_ACCOUNT_ID,
     normalizeAccountId: (value?: string | null) => value?.trim() || DEFAULT_ACCOUNT_ID,
-    normalizeAllowFromEntries: (entries: string[], normalize: (value: string) => string) => [
-      ...new Set(entries.map((entry) => (entry === "*" ? "*" : normalize(entry))).filter(Boolean)),
-    ],
+    normalizeAllowFromEntries: (entries: string[], normalize: (value: string) => string) => {
+      const normalized = new Set<string>();
+      for (const entry of entries) {
+        const value = entry === "*" ? "*" : normalize(entry);
+        if (value) {
+          normalized.add(value);
+        }
+      }
+      return [...normalized];
+    },
     normalizeE164,
     pathExists: hoisted.pathExists,
-    splitSetupEntries: (raw: string) =>
-      raw
-        .split(",")
-        .map((entry) => entry.trim())
-        .filter(Boolean),
+    splitSetupEntries: splitSetupEntriesForMock,
     setSetupChannelEnabled: (cfg: OpenClawConfig, channel: string, enabled: boolean) => ({
       ...cfg,
       channels: {
@@ -160,13 +173,6 @@ describe("whatsapp setup wizard", () => {
     hoisted.resolveWhatsAppAuthDir.mockReturnValue({ authDir: "/tmp/openclaw-whatsapp-test" });
   });
 
-  it("exposes approval auth through approvalCapability only", () => {
-    expect(whatsappPlugin.approvalCapability).toBe(whatsappApprovalAuth);
-    expect(typeof whatsappPlugin.auth?.login).toBe("function");
-    expect("authorizeActorAction" in (whatsappPlugin.auth ?? {})).toBe(false);
-    expect("getActionAvailabilityState" in (whatsappPlugin.auth ?? {})).toBe(false);
-  });
-
   it("applies owner allowlist when forceAllowFrom is enabled", async () => {
     const harness = createWhatsAppOwnerAllowlistHarness(createQueuedWizardPrompter);
 
@@ -178,6 +184,25 @@ describe("whatsapp setup wizard", () => {
     expect(result.accountId).toBe(DEFAULT_ACCOUNT_ID);
     expect(hoisted.loginWeb).not.toHaveBeenCalled();
     expectWhatsAppOwnerAllowlistSetup(result.cfg, harness);
+  });
+
+  it("rejects invalid owner numbers during prompt validation", async () => {
+    const harness = createWhatsAppOwnerAllowlistHarness(createQueuedWizardPrompter);
+
+    await runConfigureWithHarness({
+      harness,
+      forceAllowFrom: true,
+    });
+
+    const prompt = harness.text.mock.calls.at(0)?.[0] as
+      | { validate?: (value: string) => string | undefined }
+      | undefined;
+    if (!prompt?.validate) {
+      throw new Error("expected owner number validator");
+    }
+    expect(prompt.validate("abc")).toBe("Invalid number: abc");
+    expect(prompt.validate("whatsapp:")).toBe("Invalid number: whatsapp:");
+    expect(prompt.validate("+1 (555) 555-0123")).toBeUndefined();
   });
 
   it("supports disabled DM policy for separate-phone setup", async () => {
@@ -245,7 +270,7 @@ describe("whatsapp setup wizard", () => {
   });
 
   it("surfaces accounts.default group warning paths for named accounts", () => {
-    const warnings = whatsappPlugin.security?.collectWarnings?.({
+    const warnings = whatsappSetupPlugin.security?.collectWarnings?.({
       cfg: {
         channels: {
           whatsapp: {
@@ -277,7 +302,7 @@ describe("whatsapp setup wizard", () => {
   });
 
   it("surfaces mixed-case default-account group warning paths for named accounts", () => {
-    const warnings = whatsappPlugin.security?.collectWarnings?.({
+    const warnings = whatsappSetupPlugin.security?.collectWarnings?.({
       cfg: {
         channels: {
           whatsapp: {
@@ -458,7 +483,7 @@ describe("whatsapp setup wizard", () => {
     hoisted.readWebAuthState.mockResolvedValueOnce("unstable");
 
     await expect(
-      whatsappPlugin.config.isConfigured?.(
+      whatsappSetupPlugin.config.isConfigured?.(
         {
           authDir: "/tmp/work",
         } as never,

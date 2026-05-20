@@ -2,6 +2,10 @@ import { EventEmitter } from "node:events";
 import type { ClientRequest, IncomingMessage, RequestOptions } from "node:http";
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest";
 
+const ssrfMocks = {
+  resolvePinnedHostnameWithPolicy: vi.fn(),
+};
+
 // Mock http and https modules before importing the client
 vi.mock("node:https", () => {
   const httpsRequest = vi.fn();
@@ -16,6 +20,11 @@ vi.mock("node:http", () => {
   return { default: { request: httpRequest, get: httpGet }, request: httpRequest, get: httpGet };
 });
 
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
+  formatErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
+  resolvePinnedHostnameWithPolicy: ssrfMocks.resolvePinnedHostnameWithPolicy,
+}));
+
 const https = await import("node:https");
 let fakeNowMs = 1_700_000_000_000;
 let sendMessage: typeof import("./client.js").sendMessage;
@@ -29,11 +38,32 @@ type MockRequestHandler = (
   options: RequestOptions,
   callback?: RequestCallback,
 ) => ClientRequest;
+type MockHttpCall = [
+  string | URL,
+  RequestOptions & { rejectUnauthorized?: boolean },
+  RequestCallback?,
+];
+
+function firstHttpsRequestCall(label = "Synology Chat HTTPS request"): MockHttpCall {
+  const call = vi.mocked(https.request).mock.calls[0];
+  if (!call) {
+    throw new Error(`expected ${label}`);
+  }
+  return call as MockHttpCall;
+}
+
+function firstHttpsGetCall(label = "Synology Chat HTTPS get"): MockHttpCall {
+  const call = vi.mocked(https.get).mock.calls[0];
+  if (!call) {
+    throw new Error(`expected ${label}`);
+  }
+  return call as MockHttpCall;
+}
 
 function createMockResponseEmitter(statusCode: number): IncomingMessage {
   const res = new EventEmitter() as Partial<IncomingMessage>;
   res.statusCode = statusCode;
-  return res as IncomingMessage;
+  return res as unknown as IncomingMessage;
 }
 
 function createMockRequestEmitter(): ClientRequest {
@@ -41,7 +71,7 @@ function createMockRequestEmitter(): ClientRequest {
   req.write = vi.fn() as ClientRequest["write"];
   req.end = vi.fn() as ClientRequest["end"];
   req.destroy = vi.fn() as ClientRequest["destroy"];
-  return req as ClientRequest;
+  return req as unknown as ClientRequest;
 }
 
 async function settleTimers<T>(promise: Promise<T>): Promise<T> {
@@ -83,12 +113,38 @@ function installFakeTimerHarness() {
     vi.useFakeTimers();
     fakeNowMs += 10_000;
     vi.setSystemTime(fakeNowMs);
+    ssrfMocks.resolvePinnedHostnameWithPolicy.mockResolvedValue({
+      hostname: "example.com",
+      addresses: ["93.184.216.34"],
+    });
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 }
+
+const tlsVerificationDefaultCases = [
+  {
+    name: "sendMessage",
+    invoke: () => sendMessage("https://nas.example.com/incoming", "Hello"),
+  },
+  {
+    name: "sendFileUrl",
+    invoke: () => sendFileUrl("https://nas.example.com/incoming", "https://example.com/file.png"),
+  },
+];
+
+describe("Synology Chat TLS verification defaults", () => {
+  installFakeTimerHarness();
+
+  it.each(tlsVerificationDefaultCases)("$name verifies TLS by default", async ({ invoke }) => {
+    mockSuccessResponse();
+    await settleTimers(invoke());
+    const firstCall = firstHttpsRequestCall();
+    expect(firstCall[1]?.rejectUnauthorized).toBe(true);
+  });
+});
 
 describe("sendMessage", () => {
   installFakeTimerHarness();
@@ -108,24 +164,16 @@ describe("sendMessage", () => {
   it("includes user_ids when userId is numeric", async () => {
     mockSuccessResponse();
     await settleTimers(sendMessage("https://nas.example.com/incoming", "Hello", 42));
-    const httpsRequest = vi.mocked(https.request);
-    expect(httpsRequest).toHaveBeenCalled();
-    const callArgs = httpsRequest.mock.calls[0];
+    expect(vi.mocked(https.request)).toHaveBeenCalled();
+    const callArgs = firstHttpsRequestCall();
     expect(callArgs[0]).toBe("https://nas.example.com/incoming");
-  });
-
-  it("verifies TLS by default", async () => {
-    mockSuccessResponse();
-    await settleTimers(sendMessage("https://nas.example.com/incoming", "Hello"));
-    const httpsRequest = vi.mocked(https.request);
-    expect(httpsRequest.mock.calls[0]?.[1]).toMatchObject({ rejectUnauthorized: true });
   });
 
   it("only disables TLS verification when explicitly requested", async () => {
     mockSuccessResponse();
     await settleTimers(sendMessage("https://nas.example.com/incoming", "Hello", undefined, true));
-    const httpsRequest = vi.mocked(https.request);
-    expect(httpsRequest.mock.calls[0]?.[1]).toMatchObject({ rejectUnauthorized: false });
+    const firstCall = firstHttpsRequestCall();
+    expect(firstCall[1]?.rejectUnauthorized).toBe(false);
   });
 });
 
@@ -148,13 +196,49 @@ describe("sendFileUrl", () => {
     expect(result).toBe(false);
   });
 
-  it("verifies TLS by default", async () => {
+  it("respects the shared send interval before posting a file URL", async () => {
     mockSuccessResponse();
-    await settleTimers(
-      sendFileUrl("https://nas.example.com/incoming", "https://example.com/file.png"),
+    await settleTimers(sendMessage("https://nas.example.com/incoming", "hello"));
+    vi.mocked(https.request).mockClear();
+
+    const promise = sendFileUrl("https://nas.example.com/incoming", "https://example.com/file.png");
+    await Promise.resolve();
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await promise;
+    expect(vi.mocked(https.request)).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects malformed file URLs before making a request", async () => {
+    const result = await settleTimers(sendFileUrl("https://nas.example.com/incoming", "not-a-url"));
+    expect(result).toBe(false);
+    expect(ssrfMocks.resolvePinnedHostnameWithPolicy).not.toHaveBeenCalled();
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-http file URLs before making a request", async () => {
+    const result = await settleTimers(
+      sendFileUrl("https://nas.example.com/incoming", "file:///tmp/secret.txt"),
     );
-    const httpsRequest = vi.mocked(https.request);
-    expect(httpsRequest.mock.calls[0]?.[1]).toMatchObject({ rejectUnauthorized: true });
+    expect(result).toBe(false);
+    expect(ssrfMocks.resolvePinnedHostnameWithPolicy).not.toHaveBeenCalled();
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled();
+  });
+
+  it("rejects SSRF-blocked hosts before making a request", async () => {
+    ssrfMocks.resolvePinnedHostnameWithPolicy.mockRejectedValueOnce(
+      new Error("Blocked private network target"),
+    );
+    const result = await settleTimers(
+      sendFileUrl("https://nas.example.com/incoming", "http://169.254.169.254/latest/meta-data"),
+    );
+    expect(result).toBe(false);
+    expect(ssrfMocks.resolvePinnedHostnameWithPolicy).toHaveBeenCalledWith("169.254.169.254");
+    expect(vi.mocked(https.request)).not.toHaveBeenCalled();
   });
 });
 
@@ -260,12 +344,10 @@ describe("resolveLegacyWebhookNameToChatUserId", () => {
       incomingUrl: baseUrl,
       mutableWebhookUsername: "anyone",
     });
-    const httpsGet = vi.mocked(https.get);
-    expect(httpsGet).toHaveBeenCalledWith(
-      expect.stringContaining("method=user_list"),
-      expect.any(Object),
-      expect.any(Function),
-    );
+    const call = firstHttpsGetCall("Synology Chat user_list request");
+    expect(String(call[0])).toBe(baseUrl.replace("method=chatbot", "method=user_list"));
+    expect(call[1]).toEqual({ rejectUnauthorized: true });
+    expect(typeof call[2]).toBe("function");
   });
 
   it("keeps user cache scoped per incoming URL", async () => {
@@ -311,7 +393,7 @@ describe("fetchChatUsers", () => {
 
     await fetchChatUsers(freshUrl);
 
-    const httpsGet = vi.mocked(https.get);
-    expect(httpsGet.mock.calls[0]?.[1]).toMatchObject({ rejectUnauthorized: true });
+    const firstCall = firstHttpsGetCall();
+    expect(firstCall[1]?.rejectUnauthorized).toBe(true);
   });
 });

@@ -1,26 +1,24 @@
+import type { resolveCodexAppServerAuthProfileIdForAgent } from "./auth-bridge.js";
 import type { CodexAppServerClient } from "./client.js";
 import type { CodexAppServerStartOptions } from "./config.js";
-import { getSharedCodexAppServerClient } from "./shared-client.js";
+
+type AuthProfileOrderConfig = Parameters<
+  typeof resolveCodexAppServerAuthProfileIdForAgent
+>[0]["config"];
 
 export type CodexAppServerClientFactory = (
   startOptions?: CodexAppServerStartOptions,
   authProfileId?: string,
+  agentDir?: string,
+  config?: AuthProfileOrderConfig,
 ) => Promise<CodexAppServerClient>;
 
 export const defaultCodexAppServerClientFactory: CodexAppServerClientFactory = (
   startOptions,
   authProfileId,
-) => getSharedCodexAppServerClient({ startOptions, authProfileId });
-
-export function createCodexAppServerClientFactoryTestHooks(
-  setFactory: (factory: CodexAppServerClientFactory) => void,
-) {
-  return {
-    setCodexAppServerClientFactoryForTests(factory: CodexAppServerClientFactory): void {
-      setFactory(factory);
-    },
-    resetCodexAppServerClientFactoryForTests(): void {
-      setFactory(defaultCodexAppServerClientFactory);
-    },
-  } as const;
-}
+  agentDir,
+  config,
+) =>
+  import("./shared-client.js").then(({ getSharedCodexAppServerClient }) =>
+    getSharedCodexAppServerClient({ startOptions, authProfileId, agentDir, config }),
+  );

@@ -5,7 +5,7 @@ import { ensureUrbitChannelOpen, pokeUrbitChannel, scryUrbitPath } from "./chann
 import { getUrbitContext, normalizeUrbitCookie } from "./context.js";
 import { urbitFetch } from "./fetch.js";
 
-export type UrbitSseLogger = {
+type UrbitSseLogger = {
   log?: (message: string) => void;
   error?: (message: string) => void;
 };
@@ -22,6 +22,14 @@ type UrbitSseOptions = {
   maxReconnectDelay?: number;
   logger?: UrbitSseLogger;
 };
+
+function parseUrbitSsePayload(data: string): { id?: number; json?: unknown; response?: string } {
+  try {
+    return JSON.parse(data) as { id?: number; json?: unknown; response?: string };
+  } catch (cause) {
+    throw new Error("Tlon Urbit SSE event was malformed JSON", { cause });
+  }
+}
 
 export class UrbitSSEClient {
   url: string;
@@ -222,8 +230,8 @@ export class UrbitSSEClient {
         buffer += chunk.toString();
         let eventEnd;
         while ((eventEnd = buffer.indexOf("\n\n")) !== -1) {
-          const eventData = buffer.substring(0, eventEnd);
-          buffer = buffer.substring(eventEnd + 2);
+          const eventData = buffer.slice(0, eventEnd);
+          buffer = buffer.slice(eventEnd + 2);
           this.processEvent(eventData);
         }
       }
@@ -249,10 +257,10 @@ export class UrbitSSEClient {
 
     for (const line of lines) {
       if (line.startsWith("id: ")) {
-        eventId = parseInt(line.substring(4), 10);
+        eventId = Number.parseInt(line.slice(4), 10);
       }
       if (line.startsWith("data: ")) {
-        data = line.substring(6);
+        data = line.slice(6);
       }
     }
 
@@ -261,7 +269,7 @@ export class UrbitSSEClient {
     }
 
     // Track event ID and send ack if needed
-    if (eventId !== null && !isNaN(eventId)) {
+    if (eventId !== null && !Number.isNaN(eventId)) {
       if (eventId > this.lastHeardEventId) {
         this.lastHeardEventId = eventId;
         if (eventId - this.lastAcknowledgedEventId > this.ackThreshold) {
@@ -276,7 +284,7 @@ export class UrbitSSEClient {
     }
 
     try {
-      const parsed = JSON.parse(data) as { id?: number; json?: unknown; response?: string };
+      const parsed = parseUrbitSsePayload(data);
 
       if (parsed.response === "quit") {
         if (parsed.id) {
@@ -376,7 +384,7 @@ export class UrbitSSEClient {
 
     this.reconnectAttempts += 1;
     const delay = Math.min(
-      this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
+      this.reconnectDelay * 2 ** (this.reconnectAttempts - 1),
       this.maxReconnectDelay,
     );
 

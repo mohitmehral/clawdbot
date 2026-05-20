@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../runtime-api.js";
-import { _resetThreadParentContextCachesForTest } from "../thread-parent-context.js";
+import { resetThreadParentContextCachesForTest } from "../thread-parent-context.js";
 import "./message-handler-mock-support.test-support.js";
 import { getRuntimeApiMockState } from "./message-handler-mock-support.test-support.js";
 import { createMSTeamsMessageHandler } from "./message-handler.js";
@@ -15,10 +15,21 @@ const fetchChannelMessageMock = vi.hoisted(() => vi.fn());
 const fetchThreadRepliesMock = vi.hoisted(() => vi.fn(async () => []));
 const resolveTeamGroupIdMock = vi.hoisted(() => vi.fn(async () => "group-1"));
 
-vi.mock("../graph-thread.js", async () => {
-  const actual = await vi.importActual<typeof import("../graph-thread.js")>("../graph-thread.js");
+vi.mock("../graph-thread.js", () => {
+  const stripHtmlFromTeamsMessage = (html: string) =>
+    html
+      .replace(/<at[^>]*>(.*?)<\/at>/gi, "@$1")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   return {
-    ...actual,
+    stripHtmlFromTeamsMessage,
     resolveTeamGroupId: resolveTeamGroupIdMock,
     fetchChannelMessage: fetchChannelMessageMock,
     fetchThreadReplies: fetchThreadRepliesMock,
@@ -27,11 +38,20 @@ vi.mock("../graph-thread.js", async () => {
 
 describe("msteams thread parent context injection", () => {
   type MessageHandler = ReturnType<typeof createMSTeamsMessageHandler>;
+  type ParentSystemEventCall = [
+    string,
+    {
+      sessionKey: string;
+      contextKey?: string;
+      forceSenderIsOwnerFalse?: boolean;
+      trusted?: boolean;
+    },
+  ];
 
   function findParentSystemEventCall(
     mock: ReturnType<typeof vi.fn>,
-  ): [string, { sessionKey: string; contextKey?: string }] | undefined {
-    const calls = mock.mock.calls as Array<[string, { sessionKey: string; contextKey?: string }]>;
+  ): ParentSystemEventCall | undefined {
+    const calls = mock.mock.calls as ParentSystemEventCall[];
     return calls.find(([text]) => text.startsWith("Replying to @"));
   }
 
@@ -48,7 +68,7 @@ describe("msteams thread parent context injection", () => {
   }
 
   beforeEach(() => {
-    _resetThreadParentContextCachesForTest();
+    resetThreadParentContextCachesForTest();
     fetchChannelMessageMock.mockReset();
     fetchThreadRepliesMock.mockReset();
     fetchThreadRepliesMock.mockImplementation(async () => []);
@@ -76,10 +96,16 @@ describe("msteams thread parent context injection", () => {
     } as unknown as Parameters<typeof handler>[0]);
 
     const parentCall = findParentSystemEventCall(enqueueSystemEvent);
-    expect(parentCall).toBeDefined();
-    expect(parentCall?.[0]).toBe("Replying to @Alice: Can someone investigate the latency spike?");
-    expect(parentCall?.[1]?.contextKey).toContain("msteams:thread-parent:");
-    expect(parentCall?.[1]?.contextKey).toContain("thread-root-123");
+    if (!parentCall) {
+      throw new Error("expected parent thread system event");
+    }
+    expect(parentCall[0]).toBe("Replying to @Alice: Can someone investigate the latency spike?");
+    expect(parentCall[1]?.contextKey).toContain("msteams:thread-parent:");
+    expect(parentCall[1]?.contextKey).toContain("thread-root-123");
+    expect(parentCall[1]).toMatchObject({
+      forceSenderIsOwnerFalse: true,
+      trusted: false,
+    });
   });
 
   it("caches parent fetches across thread replies in the same session", async () => {

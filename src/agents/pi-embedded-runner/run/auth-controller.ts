@@ -1,4 +1,4 @@
-import type { Api, Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ThinkLevel } from "../../../auto-reply/thinking.js";
 import { formatErrorMessage } from "../../../infra/errors.js";
 import { prepareProviderRuntimeAuth } from "../../../plugins/provider-runtime.js";
@@ -9,7 +9,11 @@ import {
 } from "../../auth-profiles.js";
 import { FailoverError, resolveFailoverStatus } from "../../failover-error.js";
 import { shouldAllowCooldownProbeForReason } from "../../failover-policy.js";
-import { getApiKeyForModel, type ResolvedProviderAuth } from "../../model-auth.js";
+import {
+  formatMissingAuthError,
+  getApiKeyForModel,
+  type ResolvedProviderAuth,
+} from "../../model-auth.js";
 import {
   classifyFailoverReason,
   isFailoverErrorMessage,
@@ -353,6 +357,7 @@ export function createEmbeddedRunAuthController(params: {
       profileId: candidate,
       store: params.authStore,
       agentDir: params.agentDir,
+      workspaceDir: params.workspaceDir,
       lockedProfile: candidate != null && candidate === params.lockedProfileId,
     });
   };
@@ -364,10 +369,52 @@ export function createEmbeddedRunAuthController(params: {
     if (!apiKeyInfo.apiKey) {
       if (apiKeyInfo.mode !== "aws-sdk") {
         const runtimeModel = params.getRuntimeModel();
-        throw new Error(
-          `No API key resolved for provider "${runtimeModel.provider}" (auth mode: ${apiKeyInfo.mode}).`,
+        throw new Error(formatMissingAuthError(apiKeyInfo, runtimeModel.provider));
+      }
+      // AWS SDK auth via IMDS / instance role / ECS task role: no explicit API
+      // key is available but the SDK default credential chain can resolve
+      // credentials at runtime.  We must still call setRuntimeApiKey so that
+      // pi's authStorage considers the provider authenticated.  Try
+      // prepareProviderRuntimeAuth first (it can sign requests and return a
+      // short-lived token); fall back to a sentinel value when the provider
+      // plugin does not implement runtime auth preparation.
+      const runtimeModel = params.getRuntimeModel();
+      const AWS_SDK_AUTH_SENTINEL = "__aws_sdk_auth__";
+      try {
+        const preparedAuth = await prepareRuntimeAuthForModel({
+          runtimeModel,
+          apiKey: AWS_SDK_AUTH_SENTINEL,
+          authMode: apiKeyInfo.mode,
+          profileId: apiKeyInfo.profileId,
+        });
+        applyPreparedRuntimeRequestOverrides({ runtimeModel, preparedAuth: preparedAuth ?? {} });
+        if (preparedAuth?.apiKey) {
+          clearRuntimeAuthRefreshTimer();
+          params.authStorage.setRuntimeApiKey(runtimeModel.provider, preparedAuth.apiKey);
+          params.setRuntimeAuthState({
+            generation: nextRuntimeAuthGeneration(),
+            sourceApiKey: AWS_SDK_AUTH_SENTINEL,
+            authMode: apiKeyInfo.mode,
+            profileId: resolvedProfileId,
+            expiresAt: preparedAuth.expiresAt,
+          });
+          if (preparedAuth.expiresAt) {
+            scheduleRuntimeAuthRefresh();
+          }
+          params.setLastProfileId(resolvedProfileId);
+          return;
+        }
+      } catch (error) {
+        params.log.warn(
+          `prepareProviderRuntimeAuth failed for ${runtimeModel.provider}, falling back to sentinel: ${formatErrorMessage(error)}`,
         );
       }
+      // No runtime auth plugin resolved a real credential.  Inject the
+      // sentinel so pi's hasConfiguredAuth() passes and the AWS SDK default
+      // credential chain handles actual request signing.
+      clearRuntimeAuthRefreshTimer();
+      params.authStorage.setRuntimeApiKey(runtimeModel.provider, AWS_SDK_AUTH_SENTINEL);
+      params.setRuntimeAuthState(null);
       params.setLastProfileId(resolvedProfileId);
       return;
     }

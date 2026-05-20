@@ -38,6 +38,17 @@ function createMockClient(): {
   return { client, calls, requestMock };
 }
 
+function parseRequestJson(init: RequestInit | undefined): Record<string, unknown> {
+  if (typeof init?.body !== "string") {
+    throw new Error("expected JSON request body");
+  }
+  const parsed: unknown = JSON.parse(init.body);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("expected JSON object request body");
+  }
+  return parsed as Record<string, unknown>;
+}
+
 describe("createMattermostDraftStream", () => {
   it("creates a preview post and updates it on later changes", async () => {
     const { client, calls } = createMockClient();
@@ -56,8 +67,7 @@ describe("createMattermostDraftStream", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.path).toBe("/posts");
 
-    const createBody = JSON.parse((calls[0]?.init?.body as string | undefined) ?? "{}");
-    expect(createBody).toMatchObject({
+    expect(parseRequestJson(calls[0]?.init)).toEqual({
       channel_id: "channel-1",
       root_id: "root-1",
       message: "Running `read`…",
@@ -100,6 +110,45 @@ describe("createMattermostDraftStream", () => {
     expect(stream.postId()).toBeUndefined();
   });
 
+  it("discardPending keeps the preview post but ignores later updates", async () => {
+    const { client, calls } = createMockClient();
+    const stream = createMattermostDraftStream({
+      client,
+      channelId: "channel-1",
+      rootId: "root-1",
+      throttleMs: 0,
+    });
+
+    stream.update("Working...");
+    await stream.flush();
+    await stream.discardPending();
+    stream.update("Late update");
+    await stream.flush();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe("/posts");
+    expect(stream.postId()).toBe("post-1");
+  });
+
+  it("seal keeps the preview post and cancels pending final overwrites", async () => {
+    const { client, calls } = createMockClient();
+    const stream = createMattermostDraftStream({
+      client,
+      channelId: "channel-1",
+      rootId: "root-1",
+      throttleMs: 0,
+    });
+
+    stream.update("Working...");
+    await stream.flush();
+    stream.update("Stale final draft");
+    await stream.seal();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe("/posts");
+    expect(stream.postId()).toBe("post-1");
+  });
+
   it("stop flushes the last pending update and ignores later ones", async () => {
     const { client, calls } = createMockClient();
     const stream = createMattermostDraftStream({
@@ -119,7 +168,8 @@ describe("createMattermostDraftStream", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.path).toBe("/posts");
     expect(calls[1]?.path).toBe("/posts/post-1");
-    expect(JSON.parse((calls[1]?.init?.body as string | undefined) ?? "{}")).toMatchObject({
+    expect(parseRequestJson(calls[1]?.init)).toEqual({
+      id: "post-1",
       message: "Stale partial",
     });
   });
@@ -204,11 +254,28 @@ describe("createMattermostDraftStream", () => {
 });
 
 describe("buildMattermostToolStatusText", () => {
-  it("renders a status with the tool name", () => {
-    expect(buildMattermostToolStatusText({ name: "read" })).toBe("Running `read`…");
+  it("renders a status with the shared tool label", () => {
+    expect(buildMattermostToolStatusText({ name: "read" })).toBe("📖 Read");
   });
 
-  it("falls back to a generic running tool status", () => {
-    expect(buildMattermostToolStatusText({ name: "exec" })).toBe("Running `exec`…");
+  it("honors raw exec detail mode", () => {
+    expect(
+      buildMattermostToolStatusText({
+        name: "exec",
+        args: { command: "pnpm test -- --watch=false" },
+        detailMode: "raw",
+      }),
+    ).toBe("🛠️ run tests, `pnpm test -- --watch=false`");
+  });
+
+  it("can hide raw exec detail from status text", () => {
+    expect(
+      buildMattermostToolStatusText({
+        name: "exec",
+        args: { command: "pnpm test -- --watch=false" },
+        detailMode: "raw",
+        config: { streaming: { preview: { commandText: "status" } } },
+      }),
+    ).toBe("🛠️ Exec");
   });
 });

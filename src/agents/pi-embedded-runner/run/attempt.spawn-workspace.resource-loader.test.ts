@@ -1,43 +1,34 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  cleanupTempPaths,
-  createContextEngineAttemptRunner,
-  getHoisted,
-  resetEmbeddedAttemptHarness,
-} from "./attempt.spawn-workspace.test-support.js";
-
-const hoisted = getHoisted();
+import { describe, expect, it, vi } from "vitest";
+import { createEmbeddedAgentSessionWithResourceLoader } from "./attempt-session.js";
 
 describe("runEmbeddedAttempt resource loader wiring", () => {
-  const tempPaths: string[] = [];
-
-  beforeEach(() => {
-    resetEmbeddedAttemptHarness();
-  });
-
-  afterEach(async () => {
-    await cleanupTempPaths(tempPaths);
-  });
-
   it("passes an explicit resourceLoader to createAgentSession even without extension factories", async () => {
-    await createContextEngineAttemptRunner({
-      sessionKey: "agent:main:guildchat:dm:test-resource-loader",
-      tempPaths,
-      contextEngine: {
-        assemble: async ({ messages }) => ({
-          messages,
-          estimatedTokens: 1,
-        }),
+    const resourceLoader = { reload: vi.fn() };
+    const createAgentSession = vi.fn(async () => ({ session: { id: "session" } }));
+
+    await createEmbeddedAgentSessionWithResourceLoader({
+      createAgentSession,
+      options: {
+        cwd: "/tmp/workspace",
+        agentDir: "/tmp/agent",
+        authStorage: {},
+        modelRegistry: {},
+        model: {},
+        thinkingLevel: undefined,
+        tools: [],
+        customTools: [],
+        sessionManager: {},
+        settingsManager: {},
+        resourceLoader,
       },
     });
 
-    expect(hoisted.createAgentSessionMock).toHaveBeenCalled();
-    expect(hoisted.createAgentSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        resourceLoader: expect.objectContaining({
-          reload: expect.any(Function),
-        }),
-      }),
-    );
+    expect(createAgentSession).toHaveBeenCalledOnce();
+    const calls = createAgentSession.mock.calls as unknown as Array<[{ resourceLoader?: unknown }]>;
+    const options = calls[0]?.[0];
+    if (!options) {
+      throw new Error("Expected createAgentSession options");
+    }
+    expect(options.resourceLoader).toBe(resourceLoader);
   });
 });
