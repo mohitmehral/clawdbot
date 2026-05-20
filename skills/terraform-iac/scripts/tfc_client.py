@@ -4250,6 +4250,9 @@ output "resource_group_id" {{ value = azurerm_resource_group.this.id }}
         prompt_iam_user(org, workspace, outdir)
 
     elif args.resource == "api-gateway":
+        if not args.name:
+            print("ERROR: --name is required for api-gateway resource.")
+            sys.exit(1)
         prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region)
 
     elif args.resource == "iam-role":

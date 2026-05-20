@@ -52,6 +52,13 @@ Interactive wizards (vpc, ec2, sg, lambda, iam-user, budget, cloudtrail, cloudwa
 
 **API Gateway:** The `api-gateway` wizard creates a REST API with usage plan throttling (100 TPS default, burst 50), API key required on all methods, client certificate attached to the stage, CloudWatch execution logging with a dedicated log group, and developer portal metadata (private/public/allow-all). A MOCK integration is generated as a placeholder — replace it with your Lambda or HTTP backend before deploying. Plans from the `prod-aws` workspace; does not auto-apply.
 
+**API Gateway non-interactive usage (preferred):**
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name my-api --workspace prod-aws
+```
+When `--name` is provided and `--dir` is omitted, the config is auto-committed to the Git repo at `$TFC_GIT_REPO_DIR/prod-aws/api-gateway-<name>/main.tf` and pushed. Always omit `--dir` for api-gateway so the generated config is persisted in Git.
+
 **VPC CIDR requirement:** The VPC and landing-zone wizards derive /24 subnets from the provided CIDR using proper network arithmetic. The CIDR must be large enough to fit the required subnets (e.g. a /16 or /21 works; a /24 only yields one subnet and will be rejected if multiple AZs are requested).
 
 **Go Lambda:** When the Go runtime is selected, the wizard cross-compiles the function to a Linux/amd64 `bootstrap` binary (requires the Go toolchain on PATH). If Go is not installed, the source is packaged instead with a warning to compile manually before deploying.
