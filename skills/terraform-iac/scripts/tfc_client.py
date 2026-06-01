@@ -5095,6 +5095,149 @@ def cmd_list_workspaces(args):
         url = body.get("links", {}).get("next")
 
 
+def cmd_drift(args):
+    """Detect drift between Git configs, TFC state, and actual AWS resources.
+
+    Checks:
+    1. Git config drift — are there unapplied changes in the Git repo?
+    2. State drift — does TFC state match what's actually in AWS?
+    3. Last run status — did the last TFC run succeed or fail?
+    """
+    _require_requests()
+    workspace = args.workspace
+    ws_id = get_workspace_id(workspace)
+    if not ws_id:
+        return
+
+    print(f"\n🔍 Drift Detection — workspace: {workspace}")
+    print("═" * 60)
+
+    # --- 1. Check TFC last run status ---
+    r = requests.get(f"{TFC_API}/workspaces/{ws_id}/runs?page[size]=1", headers=api_headers())
+    if r.status_code == 200:
+        runs = r.json().get("data", [])
+        if runs:
+            last_run = runs[0]["attributes"]
+            status = last_run.get("status", "unknown")
+            created = last_run.get("created-at", "unknown")
+            has_changes = last_run.get("has-changes", False)
+            print(f"\n  Last TFC run:")
+            print(f"    Status     : {status}")
+            print(f"    Created    : {created}")
+            print(f"    Has changes: {has_changes}")
+            if status in ("errored", "canceled", "force_canceled"):
+                print(f"    ⚠️  Last run {status} — infrastructure may be in inconsistent state")
+        else:
+            print("\n  No runs found — workspace has never been applied.")
+    else:
+        print(f"  WARNING: Could not fetch runs (HTTP {r.status_code})")
+
+    # --- 2. Check TFC state version vs Git ---
+    r2 = requests.get(f"{TFC_API}/workspaces/{ws_id}/current-state-version", headers=api_headers())
+    if r2.status_code == 404:
+        print("\n  No state in TFC — nothing deployed yet.")
+        print("  If Git has configs, they are unapplied.")
+    elif r2.status_code == 200:
+        state_attrs = r2.json()["data"]["attributes"]
+        state_serial = state_attrs.get("serial", 0)
+        state_updated = state_attrs.get("created-at", "unknown")
+        print(f"\n  TFC state:")
+        print(f"    Serial     : {state_serial}")
+        print(f"    Last update: {state_updated}")
+
+    # --- 3. Scan Git repo for unapplied configs ---
+    if _git_enabled():
+        repo_dir = Path(_git_repo_dir())
+        ws_dir = repo_dir / workspace
+        if ws_dir.is_dir():
+            resource_dirs = [d for d in ws_dir.iterdir() if d.is_dir() and (d / "main.tf").exists()]
+            if resource_dirs:
+                print(f"\n  Git configs ({len(resource_dirs)} resources in {ws_dir}):")
+
+                # Check git log for last apply commit
+                last_apply = _git("log", "--oneline", "--grep=apply:", "-1", cwd=str(repo_dir), check=False)
+                last_generate = _git("log", "--oneline", "--grep=generate:", "-1", cwd=str(repo_dir), check=False)
+
+                if last_apply.stdout.strip():
+                    print(f"    Last apply commit : {last_apply.stdout.strip()}")
+                if last_generate.stdout.strip():
+                    print(f"    Last generate     : {last_generate.stdout.strip()}")
+
+                # Check if there are commits after last apply
+                if last_apply.stdout.strip():
+                    apply_hash = last_apply.stdout.strip().split()[0]
+                    unapplied = _git("log", "--oneline", f"{apply_hash}..HEAD", "--", workspace, cwd=str(repo_dir), check=False)
+                    unapplied_lines = [l for l in unapplied.stdout.strip().split("\n") if l.strip()]
+                    if unapplied_lines:
+                        print(f"\n    ⚠️  {len(unapplied_lines)} unapplied commit(s) since last apply:")
+                        for line in unapplied_lines[:10]:
+                            print(f"       {line}")
+                        if len(unapplied_lines) > 10:
+                            print(f"       ... and {len(unapplied_lines) - 10} more")
+                    else:
+                        print("\n    ✅ Git is in sync — no unapplied changes since last apply.")
+                else:
+                    print("\n    ⚠️  No apply commits found — all configs may be unapplied.")
+
+                # List resources
+                print(f"\n    Resources:")
+                for d in sorted(resource_dirs):
+                    # Check if main.tf was modified after last apply
+                    mtime = (d / "main.tf").stat().st_mtime
+                    from datetime import datetime, timezone
+                    modified = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                    print(f"      {d.name:<35} (modified: {modified})")
+            else:
+                print(f"\n  No resource configs found in {ws_dir}")
+        else:
+            print(f"\n  No Git directory for workspace '{workspace}' at {ws_dir}")
+    else:
+        print("\n  Git versioning disabled (set TFC_GIT_ENABLED=true to track configs)")
+
+    # --- 4. Run plan to detect actual drift (optional) ---
+    if args.plan:
+        if _git_enabled():
+            repo_dir = Path(_git_repo_dir())
+            ws_dir = repo_dir / workspace
+            if ws_dir.is_dir():
+                resource_dirs = [d for d in ws_dir.iterdir() if d.is_dir() and (d / "main.tf").exists()]
+                print(f"\n  Running plan on {len(resource_dirs)} resource(s) to detect real drift...")
+                print("  " + "-" * 56)
+                drifted = []
+                clean = []
+                for d in sorted(resource_dirs):
+                    print(f"\n    📋 {d.name}:")
+                    tf_init(str(d))
+                    result = subprocess.run(
+                        ["terraform", "plan", "-detailed-exitcode", "-no-color"],
+                        cwd=str(d), capture_output=True, text=True,
+                    )
+                    if result.returncode == 0:
+                        print(f"       ✅ No changes — in sync")
+                        clean.append(d.name)
+                    elif result.returncode == 2:
+                        print(f"       ⚠️  DRIFT DETECTED — changes needed")
+                        # Show summary of changes
+                        for line in result.stdout.split("\n"):
+                            if line.strip().startswith(("#", "Plan:")):
+                                print(f"       {line.strip()}")
+                        drifted.append(d.name)
+                    else:
+                        print(f"       ❌ Plan failed")
+                        if result.stderr.strip():
+                            print(f"       {result.stderr.strip()[:200]}")
+
+                print(f"\n  " + "═" * 56)
+                print(f"  Summary: {len(clean)} in sync, {len(drifted)} drifted")
+                if drifted:
+                    print(f"  Drifted: {', '.join(drifted)}")
+                    print(f"  Fix: run 'plan' then 'apply' on each drifted resource")
+    else:
+        print(f"\n  💡 Run with --plan to execute terraform plan and detect real infrastructure drift")
+
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Terraform IaC client for OpenClaw")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -5134,6 +5277,10 @@ def main():
 
     sub.add_parser("list-workspaces")
 
+    p_drift = sub.add_parser("drift")
+    p_drift.add_argument("--workspace", required=True)
+    p_drift.add_argument("--plan", action="store_true", default=False, help="Run terraform plan on each resource to detect real drift")
+
     args = parser.parse_args()
 
     commands = {
@@ -5144,6 +5291,7 @@ def main():
         "state": cmd_state,
         "outputs": cmd_outputs,
         "list-workspaces": cmd_list_workspaces,
+        "drift": cmd_drift,
     }
     commands[args.command](args)
 

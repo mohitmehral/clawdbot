@@ -180,6 +180,27 @@ To answer "what's currently deployed":
 python3 {baseDir}/scripts/tfc_client.py state --workspace prod-aws
 ```
 
+## Drift Detection
+
+To check if Git configs, TFC state, and actual AWS resources are in sync:
+
+```bash
+# Quick check (Git vs TFC metadata, no plan)
+python3 {baseDir}/scripts/tfc_client.py drift --workspace prod-aws
+
+# Full check (runs terraform plan on each resource to detect real drift)
+python3 {baseDir}/scripts/tfc_client.py drift --workspace prod-aws --plan
+```
+
+The drift command reports:
+
+- **Last TFC run status** — did the last apply succeed or fail?
+- **TFC state serial + timestamp** — when was state last updated?
+- **Unapplied Git commits** — configs changed in Git but not yet applied
+- **Per-resource plan** (with `--plan`) — actual infrastructure drift vs declared config
+
+Run drift detection before making changes to understand current state.
+
 ## Workspace Management
 
 ```bash
