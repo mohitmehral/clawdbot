@@ -2499,6 +2499,12 @@ resource "aws_iam_role_policy_attachment" "apigw_cloudwatch" {{
 
 resource "aws_api_gateway_account" "this" {{
   cloudwatch_role_arn = aws_iam_role.apigw_cloudwatch.arn
+
+  lifecycle {{
+    # This is a singleton resource (one per account/region).
+    # Prevent destroy to avoid the "Resource Destruction" warning.
+    prevent_destroy = true
+  }}
 }}
 
 # ─── CloudWatch Log Group ──────────────────────────────────────────────────
