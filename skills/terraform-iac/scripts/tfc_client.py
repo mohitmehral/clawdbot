@@ -2240,7 +2240,7 @@ output "audit_account_id"   {{ value = aws_organizations_account.audit.id }}
     print(f"   VPC baseline    : {'enabled (' + vpc_cidr + ')' if enable_vpc_baseline else 'disabled'}")
     print(f"   Account vending : {'enabled ($' + vending_budget + '/mo budget)' if enable_vending else 'disabled'}")
 
-def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None, cli_domain=None, cli_hosted_zone_id=None, cli_waf=False):
+def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None, cli_domain=None, cli_hosted_zone_id=None, cli_waf=False, cli_backend=None, cli_lambda_runtime=None, cli_http_endpoint=None):
     """Generate API Gateway REST API config with per-team isolation.
 
     Architecture: Option A — shared API Gateway, per-team usage plans + API keys.
@@ -2330,9 +2330,18 @@ Each team gets:
             waf_rate_limit = prompt_num("  WAF rate limit (requests per 5 min per IP)", default=2000, min_val=100)
         else:
             waf_rate_limit = 2000
-        print("\n  Backend for this team's path:")
-        print("    A MOCK integration is created as placeholder.")
-        print("    TODO: Replace with VPC Link to team's EKS NLB.")
+        print("\n  Backend integration:")
+        print("    1) MOCK     — placeholder (no real backend)")
+        print("    2) Lambda   — create new Lambda function as backend")
+        print("    3) HTTP     — proxy to existing HTTP endpoint")
+        backend_choice = prompt("  Backend type", default="lambda", choices=["mock", "lambda", "http"])
+        backend_type = backend_choice
+        lambda_runtime = None
+        http_endpoint = None
+        if backend_type == "lambda":
+            lambda_runtime = prompt("  Lambda runtime", default="python3.12", choices=["python3.12", "python3.11", "nodejs20.x", "nodejs18.x"])
+        elif backend_type == "http":
+            http_endpoint = prompt("  HTTP endpoint URL (e.g. https://backend.internal/api)")
         print(f"\n  How EKS pods in team '{team_name}' will consume this API:")
         print(f"    1. Mount K8s Secret with API key in namespace '{team_safe}'")
         print(f"    2. Call: https://{{api-gw-url}}/{team_safe}/{{resource}}")
@@ -2357,6 +2366,9 @@ Each team gets:
         hosted_zone_id = cli_hosted_zone_id
         enable_waf = cli_waf
         waf_rate_limit = 2000
+        backend_type = cli_backend or "mock"
+        lambda_runtime = cli_lambda_runtime or "python3.12"
+        http_endpoint = cli_http_endpoint
 
     stage_name = env
     cw_log_level = "INFO"
@@ -2501,49 +2513,14 @@ resource "aws_api_gateway_client_certificate" "this" {{
   tags        = local.tags
 }}
 
-# ─── Resource + Method (MOCK — TODO: replace with real integration) ────────
+# ─── Resource + Integration ─────────────────────────────────────────────────
 resource "aws_api_gateway_resource" "{resource_path}" {{
   rest_api_id = aws_api_gateway_rest_api.this.id
   parent_id   = aws_api_gateway_rest_api.this.root_resource_id
   path_part   = "{resource_path}"
 }}
 
-resource "aws_api_gateway_method" "{resource_path}_get" {{
-  rest_api_id      = aws_api_gateway_rest_api.this.id
-  resource_id      = aws_api_gateway_resource.{resource_path}.id
-  http_method      = "GET"
-  authorization    = "NONE"
-  api_key_required = true  # API key enforced by default
-}}
-
-resource "aws_api_gateway_integration" "{resource_path}_get" {{
-  rest_api_id = aws_api_gateway_rest_api.this.id
-  resource_id = aws_api_gateway_resource.{resource_path}.id
-  http_method = aws_api_gateway_method.{resource_path}_get.http_method
-  type        = "MOCK"
-
-  request_templates = {{
-    "application/json" = jsonencode({{ statusCode = 200 }})
-  }}
-}}
-
-resource "aws_api_gateway_method_response" "{resource_path}_get_200" {{
-  rest_api_id = aws_api_gateway_rest_api.this.id
-  resource_id = aws_api_gateway_resource.{resource_path}.id
-  http_method = aws_api_gateway_method.{resource_path}_get.http_method
-  status_code = "200"
-}}
-
-resource "aws_api_gateway_integration_response" "{resource_path}_get_200" {{
-  rest_api_id = aws_api_gateway_rest_api.this.id
-  resource_id = aws_api_gateway_resource.{resource_path}.id
-  http_method = aws_api_gateway_method.{resource_path}_get.http_method
-  status_code = aws_api_gateway_method_response.{resource_path}_get_200.status_code
-
-  response_templates = {{
-    "application/json" = jsonencode({{ message = "TODO: connect real backend" }})
-  }}
-}}
+{{integration_block}}
 
 {cors_block}
 
@@ -2554,8 +2531,7 @@ resource "aws_api_gateway_deployment" "this" {{
   triggers = {{
     redeployment = sha1(jsonencode([
       aws_api_gateway_resource.{resource_path}.id,
-      aws_api_gateway_method.{resource_path}_get.id,
-      aws_api_gateway_integration.{resource_path}_get.id,
+      {{deployment_trigger_refs}}
     ]))
   }}
 
@@ -2666,6 +2642,163 @@ output "usage_plan_id" {{
 
 {{custom_domain_outputs}}
 """
+
+    # Integration block (MOCK / Lambda / HTTP)
+    if backend_type == "lambda":
+        # Determine handler and filename based on runtime
+        if lambda_runtime.startswith("python"):
+            handler_file = "lambda_function.py"
+            handler_ref = "lambda_function.lambda_handler"
+            handler_code = f'''import json\n\ndef lambda_handler(event, context):\n    method = event.get("httpMethod", "GET")\n    path = event.get("path", "/")\n    body = event.get("body")\n    if body and isinstance(body, str):\n        try:\n            body = json.loads(body)\n        except Exception:\n            pass\n\n    return {{\n        "statusCode": 200,\n        "headers": {{"Content-Type": "application/json"}},\n        "body": json.dumps({{\n            "message": "Hello from {name}",\n            "method": method,\n            "path": path,\n        }}),\n    }}\n'''
+        else:
+            handler_file = "index.mjs"
+            handler_ref = "index.handler"
+            handler_code = f'''export const handler = async (event) => {{\n  const method = event.httpMethod || "GET";\n  const path = event.path || "/";\n  let body = event.body;\n  if (body && typeof body === "string") try {{ body = JSON.parse(body); }} catch (e) {{}}\n\n  return {{\n    statusCode: 200,\n    headers: {{ "Content-Type": "application/json" }},\n    body: JSON.stringify({{\n      message: "Hello from {name}",\n      method,\n      path,\n    }}),\n  }};\n}};\n'''
+
+        # Write Lambda source file
+        lambda_dir = outdir / "lambda"
+        lambda_dir.mkdir(parents=True, exist_ok=True)
+        (lambda_dir / handler_file).write_text(handler_code)
+
+        integration_block = f"""
+# ─── Lambda Function ───────────────────────────────────────────────────────
+resource "aws_iam_role" "lambda" {{
+  name = "{name}-{resource_path}-lambda-role"
+  assume_role_policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [{{
+      Effect    = "Allow"
+      Principal = {{ Service = "lambda.amazonaws.com" }}
+      Action    = "sts:AssumeRole"
+    }}]
+  }})
+  tags = local.tags
+}}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic" {{
+  role       = aws_iam_role.lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}}
+
+data "archive_file" "lambda" {{
+  type        = "zip"
+  source_dir  = "${{path.module}}/lambda"
+  output_path = "${{path.module}}/lambda.zip"
+}}
+
+resource "aws_lambda_function" "this" {{
+  function_name    = "{name}-{resource_path}"
+  role             = aws_iam_role.lambda.arn
+  handler          = "{handler_ref}"
+  runtime          = "{lambda_runtime}"
+  filename         = data.archive_file.lambda.output_path
+  source_code_hash = data.archive_file.lambda.output_base64sha256
+  timeout          = 30
+  memory_size      = 256
+
+  environment {{
+    variables = {{
+      ENVIRONMENT = "{env}"
+    }}
+  }}
+
+  tags = local.tags
+}}
+
+resource "aws_lambda_permission" "apigw" {{
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.this.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${{aws_api_gateway_rest_api.this.execution_arn}}/*/*"
+}}
+
+# ─── API Gateway Method + Lambda Integration ─────────────────────────────
+resource "aws_api_gateway_method" "{resource_path}_any" {{
+  rest_api_id      = aws_api_gateway_rest_api.this.id
+  resource_id      = aws_api_gateway_resource.{resource_path}.id
+  http_method      = "ANY"
+  authorization    = "NONE"
+  api_key_required = true
+}}
+
+resource "aws_api_gateway_integration" "{resource_path}_any" {{
+  rest_api_id             = aws_api_gateway_rest_api.this.id
+  resource_id             = aws_api_gateway_resource.{resource_path}.id
+  http_method             = aws_api_gateway_method.{resource_path}_any.http_method
+  type                    = "AWS_PROXY"
+  integration_http_method = "POST"
+  uri                     = aws_lambda_function.this.invoke_arn
+}}
+"""
+    elif backend_type == "http":
+        integration_block = f"""
+resource "aws_api_gateway_method" "{resource_path}_any" {{
+  rest_api_id      = aws_api_gateway_rest_api.this.id
+  resource_id      = aws_api_gateway_resource.{resource_path}.id
+  http_method      = "ANY"
+  authorization    = "NONE"
+  api_key_required = true
+}}
+
+resource "aws_api_gateway_integration" "{resource_path}_any" {{
+  rest_api_id             = aws_api_gateway_rest_api.this.id
+  resource_id             = aws_api_gateway_resource.{resource_path}.id
+  http_method             = aws_api_gateway_method.{resource_path}_any.http_method
+  type                    = "HTTP_PROXY"
+  integration_http_method = "ANY"
+  uri                     = "{http_endpoint}/{resource_path}"
+}}
+"""
+    else:
+        # MOCK (default)
+        integration_block = f"""
+resource "aws_api_gateway_method" "{resource_path}_get" {{
+  rest_api_id      = aws_api_gateway_rest_api.this.id
+  resource_id      = aws_api_gateway_resource.{resource_path}.id
+  http_method      = "GET"
+  authorization    = "NONE"
+  api_key_required = true
+}}
+
+resource "aws_api_gateway_integration" "{resource_path}_get" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_get.http_method
+  type        = "MOCK"
+
+  request_templates = {{
+    "application/json" = jsonencode({{ statusCode = 200 }})
+  }}
+}}
+
+resource "aws_api_gateway_method_response" "{resource_path}_get_200" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_get.http_method
+  status_code = "200"
+}}
+
+resource "aws_api_gateway_integration_response" "{resource_path}_get_200" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_get.http_method
+  status_code = aws_api_gateway_method_response.{resource_path}_get_200.status_code
+
+  response_templates = {{
+    "application/json" = jsonencode({{ message = "TODO: connect real backend" }})
+  }}
+}}
+"""
+
+    main_tf = main_tf.replace("{integration_block}", integration_block)
+
+    # Deployment trigger refs
+    if backend_type in ("lambda", "http"):
+        deploy_refs = f"aws_api_gateway_method.{resource_path}_any.id,\n      aws_api_gateway_integration.{resource_path}_any.id,"
+    else:
+        deploy_refs = f"aws_api_gateway_method.{resource_path}_get.id,\n      aws_api_gateway_integration.{resource_path}_get.id,"
+    main_tf = main_tf.replace("{deployment_trigger_refs}", deploy_refs)
 
     # Custom domain block
     custom_domain_block = ""
@@ -2857,7 +2990,13 @@ resource "aws_wafv2_web_acl_association" "api" {{
         print(f"   Custom domain  : {custom_domain} (ACM + Route53 alias)")
     if enable_waf:
         print(f"   WAF            : enabled (rate limit {waf_rate_limit} req/5min + IP reputation + bad inputs)")
-    print(f"   ⚠️  MOCK integration on /{resource_path} — replace with real backend before deploy")
+    if backend_type == "lambda":
+        print(f"   Backend        : Lambda ({lambda_runtime}) → {name}-{resource_path}")
+        print(f"   Lambda source  : {outdir}/lambda/{handler_file}")
+    elif backend_type == "http":
+        print(f"   Backend        : HTTP proxy → {http_endpoint}/{resource_path}")
+    else:
+        print(f"   ⚠️  MOCK integration on /{resource_path} — replace with real backend before deploy")
     print(f"   Run: python3 tfc_client.py plan --dir {outdir}")
 
 
@@ -4547,7 +4686,7 @@ output "resource_group_id" {{ value = azurerm_resource_group.this.id }}
         if not args.name:
             print("ERROR: --name is required for api-gateway resource.")
             sys.exit(1)
-        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region, cli_domain=args.domain, cli_hosted_zone_id=args.hosted_zone_id, cli_waf=args.waf)
+        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region, cli_domain=args.domain, cli_hosted_zone_id=args.hosted_zone_id, cli_waf=args.waf, cli_backend=args.backend, cli_lambda_runtime=args.lambda_runtime, cli_http_endpoint=args.http_endpoint)
 
     elif args.resource == "iam-role":
         if not args.name:
@@ -4827,6 +4966,9 @@ def main():
     p_gen.add_argument("--domain", default=None, help="Custom domain for API Gateway (e.g. api.example.com)")
     p_gen.add_argument("--hosted-zone-id", dest="hosted_zone_id", default=None, help="Route53 Hosted Zone ID for custom domain")
     p_gen.add_argument("--waf", action="store_true", default=False, help="Attach WAF WebACL with rate limiting and IP reputation rules")
+    p_gen.add_argument("--backend", default=None, choices=["mock", "lambda", "http"], help="API Gateway backend type")
+    p_gen.add_argument("--lambda-runtime", dest="lambda_runtime", default=None, choices=["python3.12", "python3.11", "nodejs20.x", "nodejs18.x"], help="Lambda runtime (when --backend=lambda)")
+    p_gen.add_argument("--http-endpoint", dest="http_endpoint", default=None, help="HTTP backend URL (when --backend=http)")
     p_gen.add_argument("--service", default=None, help="AWS service principal for IAM role trust policy (e.g. ec2.amazonaws.com)")
     p_gen.add_argument("--policy-arn", dest="policy_arn", default=None, help="AWS managed policy ARN to attach to IAM role")
 

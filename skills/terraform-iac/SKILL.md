@@ -82,6 +82,35 @@ python3 {baseDir}/scripts/tfc_client.py generate \
 
 When `--waf` is provided, attaches an AWS WAFv2 WebACL with: rate limiting (2000 req/5min per IP default), AWS Managed IP Reputation List, and AWS Managed Known Bad Inputs rule group. The WAF is associated with the API Gateway stage.
 
+**API Gateway with Lambda backend (creates function if not exists):**
+
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name my-api --workspace prod-aws \
+  --backend lambda --lambda-runtime python3.12
+```
+
+When `--backend lambda` is provided, the generator creates a complete Lambda function (IAM role, zip archive, function resource, API Gateway permission) and wires it as an `AWS_PROXY` integration. The Lambda source code is written to `<dir>/lambda/` with a starter handler. Supported runtimes: `python3.12`, `python3.11`, `nodejs20.x`, `nodejs18.x`.
+
+**API Gateway with HTTP proxy backend:**
+
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name my-api --workspace prod-aws \
+  --backend http --http-endpoint https://backend.internal/api
+```
+
+When `--backend http` is provided, creates an `HTTP_PROXY` integration forwarding all methods to the specified endpoint URL.
+
+**Full example (Lambda + domain + WAF):**
+
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name orders --workspace prod-aws \
+  --backend lambda --lambda-runtime python3.12 \
+  --domain api.example.com --hosted-zone-id Z1234567890ABC --waf
+```
+
 When `--name` is provided and `--dir` is omitted, the config is auto-committed to the Git repo at `$TFC_GIT_REPO_DIR/prod-aws/api-gateway-<name>/main.tf` and pushed. Always omit `--dir` for api-gateway so the generated config is persisted in Git.
 
 **VPC CIDR requirement:** The VPC and landing-zone wizards derive /24 subnets from the provided CIDR using proper network arithmetic. The CIDR must be large enough to fit the required subnets (e.g. a /16 or /21 works; a /24 only yields one subnet and will be rejected if multiple AZs are requested).
