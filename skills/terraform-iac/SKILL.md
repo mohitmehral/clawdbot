@@ -54,7 +54,7 @@ Supported resources: `s3`, `vpc`, `ec2`, `sg`, `lambda`, `iam-user`, `iam-role`,
 
 Interactive wizards (vpc, ec2, sg, lambda, iam-user, budget, cloudtrail, cloudwatch, efs, landing-zone, api-gateway) will prompt for configuration with design guidance.
 
-**API Gateway:** The `api-gateway` wizard creates a REST API with usage plan throttling (100 TPS default, burst 50), API key required on all methods, client certificate attached to the stage, CloudWatch execution logging with a dedicated log group, CORS preflight (OPTIONS method with Access-Control-Allow-\* headers), and developer portal metadata (private/public/allow-all). A MOCK integration is generated as a placeholder — replace it with your Lambda or HTTP backend before deploying. Plans from the `prod-aws` workspace; does not auto-apply.
+**API Gateway:** The `api-gateway` wizard creates a REST API with usage plan throttling (100 TPS default, burst 50), API key required on all methods, client certificate attached to the stage, CloudWatch execution logging with a dedicated log group, CORS preflight (OPTIONS method with Access-Control-Allow-\* headers), optional WAF WebACL (rate limiting + IP reputation + known bad inputs), and developer portal metadata (private/public/allow-all). A MOCK integration is generated as a placeholder — replace it with your Lambda or HTTP backend before deploying. Plans from the `prod-aws` workspace; does not auto-apply.
 
 **API Gateway non-interactive usage (preferred):**
 
@@ -72,6 +72,15 @@ python3 {baseDir}/scripts/tfc_client.py generate \
 ```
 
 When `--domain` and `--hosted-zone-id` are provided, the generator adds an ACM certificate (DNS-validated), Route53 validation records, API Gateway custom domain name (REGIONAL), base path mapping, and a Route53 A-record alias. The certificate is validated automatically via DNS.
+
+**API Gateway with WAF:**
+
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name my-api --workspace prod-aws --waf
+```
+
+When `--waf` is provided, attaches an AWS WAFv2 WebACL with: rate limiting (2000 req/5min per IP default), AWS Managed IP Reputation List, and AWS Managed Known Bad Inputs rule group. The WAF is associated with the API Gateway stage.
 
 When `--name` is provided and `--dir` is omitted, the config is auto-committed to the Git repo at `$TFC_GIT_REPO_DIR/prod-aws/api-gateway-<name>/main.tf` and pushed. Always omit `--dir` for api-gateway so the generated config is persisted in Git.
 

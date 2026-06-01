@@ -2240,7 +2240,7 @@ output "audit_account_id"   {{ value = aws_organizations_account.audit.id }}
     print(f"   VPC baseline    : {'enabled (' + vpc_cidr + ')' if enable_vpc_baseline else 'disabled'}")
     print(f"   Account vending : {'enabled ($' + vending_budget + '/mo budget)' if enable_vending else 'disabled'}")
 
-def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None, cli_domain=None, cli_hosted_zone_id=None):
+def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None, cli_domain=None, cli_hosted_zone_id=None, cli_waf=False):
     """Generate API Gateway REST API config with per-team isolation.
 
     Architecture: Option A — shared API Gateway, per-team usage plans + API keys.
@@ -2324,6 +2324,12 @@ Each team gets:
             hosted_zone_id = hosted_zone_id_input.strip()
         else:
             hosted_zone_id = None
+        waf_choice = prompt("\n  Attach WAF WebACL (rate limiting + IP reputation)?", default="yes", choices=["yes", "no"])
+        enable_waf = waf_choice == "yes"
+        if enable_waf:
+            waf_rate_limit = prompt_num("  WAF rate limit (requests per 5 min per IP)", default=2000, min_val=100)
+        else:
+            waf_rate_limit = 2000
         print("\n  Backend for this team's path:")
         print("    A MOCK integration is created as placeholder.")
         print("    TODO: Replace with VPC Link to team's EKS NLB.")
@@ -2349,6 +2355,8 @@ Each team gets:
         enable_cors = True
         custom_domain = cli_domain
         hosted_zone_id = cli_hosted_zone_id
+        enable_waf = cli_waf
+        waf_rate_limit = 2000
 
     stage_name = env
     cw_log_level = "INFO"
@@ -2624,6 +2632,8 @@ resource "aws_api_gateway_usage_plan_key" "this" {{
 
 {{custom_domain_block}}
 
+{{waf_block}}
+
 # ─── Outputs ───────────────────────────────────────────────────────────────
 output "api_id" {{
   value = aws_api_gateway_rest_api.this.id
@@ -2735,6 +2745,106 @@ output "custom_domain_url" {{
     main_tf = main_tf.replace("{custom_domain_block}", custom_domain_block)
     main_tf = main_tf.replace("{custom_domain_outputs}", custom_domain_outputs)
 
+    # WAF block
+    waf_block = ""
+    if enable_waf:
+        waf_block = f"""
+# ─── WAF WebACL ─────────────────────────────────────────────────────────────
+resource "aws_wafv2_web_acl" "api" {{
+  name        = "{name}-waf"
+  description = "WAF for {name} API Gateway"
+  scope       = "REGIONAL"
+
+  default_action {{
+    allow {{}}
+  }}
+
+  # Rate limiting rule
+  rule {{
+    name     = "rate-limit"
+    priority = 1
+
+    action {{
+      block {{}}
+    }}
+
+    statement {{
+      rate_based_statement {{
+        limit              = {waf_rate_limit}
+        aggregate_key_type = "IP"
+      }}
+    }}
+
+    visibility_config {{
+      sampled_requests_enabled   = true
+      cloudwatch_metrics_enabled = true
+      metric_name                = "{name}-rate-limit"
+    }}
+  }}
+
+  # AWS Managed IP reputation rule
+  rule {{
+    name     = "ip-reputation"
+    priority = 2
+
+    override_action {{
+      none {{}}
+    }}
+
+    statement {{
+      managed_rule_group_statement {{
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesAmazonIpReputationList"
+      }}
+    }}
+
+    visibility_config {{
+      sampled_requests_enabled   = true
+      cloudwatch_metrics_enabled = true
+      metric_name                = "{name}-ip-reputation"
+    }}
+  }}
+
+  # AWS Managed known bad inputs rule
+  rule {{
+    name     = "known-bad-inputs"
+    priority = 3
+
+    override_action {{
+      none {{}}
+    }}
+
+    statement {{
+      managed_rule_group_statement {{
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesKnownBadInputsRuleGroup"
+      }}
+    }}
+
+    visibility_config {{
+      sampled_requests_enabled   = true
+      cloudwatch_metrics_enabled = true
+      metric_name                = "{name}-known-bad-inputs"
+    }}
+  }}
+
+  visibility_config {{
+    sampled_requests_enabled   = true
+    cloudwatch_metrics_enabled = true
+    metric_name                = "{name}-waf"
+  }}
+
+  tags = local.tags
+}}
+
+resource "aws_wafv2_web_acl_association" "api" {{
+  resource_arn = aws_api_gateway_stage.{stage_name}.arn
+  web_acl_arn  = aws_wafv2_web_acl.api.arn
+}}
+"""
+
+    main_tf = main_tf.replace("{waf_block}", waf_block)
+
     (outdir / "main.tf").write_text(main_tf)
     print(f"\n✅ Generated {outdir}/main.tf for API Gateway '{name}'")
     print(f"   Stage          : {stage_name}")
@@ -2745,6 +2855,8 @@ output "custom_domain_url" {{
     print(f"   Portal         : {portal_visibility}")
     if custom_domain:
         print(f"   Custom domain  : {custom_domain} (ACM + Route53 alias)")
+    if enable_waf:
+        print(f"   WAF            : enabled (rate limit {waf_rate_limit} req/5min + IP reputation + bad inputs)")
     print(f"   ⚠️  MOCK integration on /{resource_path} — replace with real backend before deploy")
     print(f"   Run: python3 tfc_client.py plan --dir {outdir}")
 
@@ -4435,7 +4547,7 @@ output "resource_group_id" {{ value = azurerm_resource_group.this.id }}
         if not args.name:
             print("ERROR: --name is required for api-gateway resource.")
             sys.exit(1)
-        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region, cli_domain=args.domain, cli_hosted_zone_id=args.hosted_zone_id)
+        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region, cli_domain=args.domain, cli_hosted_zone_id=args.hosted_zone_id, cli_waf=args.waf)
 
     elif args.resource == "iam-role":
         if not args.name:
@@ -4714,6 +4826,7 @@ def main():
     p_gen.add_argument("--region", default=None)
     p_gen.add_argument("--domain", default=None, help="Custom domain for API Gateway (e.g. api.example.com)")
     p_gen.add_argument("--hosted-zone-id", dest="hosted_zone_id", default=None, help="Route53 Hosted Zone ID for custom domain")
+    p_gen.add_argument("--waf", action="store_true", default=False, help="Attach WAF WebACL with rate limiting and IP reputation rules")
     p_gen.add_argument("--service", default=None, help="AWS service principal for IAM role trust policy (e.g. ec2.amazonaws.com)")
     p_gen.add_argument("--policy-arn", dest="policy_arn", default=None, help="AWS managed policy ARN to attach to IAM role")
 
