@@ -111,6 +111,27 @@ python3 {baseDir}/scripts/tfc_client.py generate \
   --domain api.example.com --hosted-zone-id Z1234567890ABC --waf
 ```
 
+**API Gateway with Cognito authorizer:**
+
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name my-api --workspace prod-aws \
+  --backend lambda --authorizer cognito \
+  --cognito-arns "arn:aws:cognito-idp:us-east-1:123456789012:userpool/us-east-1_ABC"
+```
+
+When `--authorizer cognito` is provided, creates a `COGNITO_USER_POOLS` authorizer. Clients must send a valid Cognito JWT in the `Authorization` header. Supports comma-separated ARNs for multiple user pools.
+
+**API Gateway with Lambda authorizer (custom token validation):**
+
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name my-api --workspace prod-aws \
+  --backend lambda --authorizer lambda
+```
+
+When `--authorizer lambda` is provided, creates a TOKEN-based Lambda authorizer with a starter function at `<dir>/authorizer/index.mjs`. The authorizer validates the `Authorization` header and returns an IAM policy. Replace the placeholder validation logic with JWT verification or your own auth scheme. Results are cached for 300s.
+
 When `--name` is provided and `--dir` is omitted, the config is auto-committed to the Git repo at `$TFC_GIT_REPO_DIR/prod-aws/api-gateway-<name>/main.tf` and pushed. Always omit `--dir` for api-gateway so the generated config is persisted in Git.
 
 **VPC CIDR requirement:** The VPC and landing-zone wizards derive /24 subnets from the provided CIDR using proper network arithmetic. The CIDR must be large enough to fit the required subnets (e.g. a /16 or /21 works; a /24 only yields one subnet and will be rejected if multiple AZs are requested).

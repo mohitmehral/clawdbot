@@ -2240,7 +2240,7 @@ output "audit_account_id"   {{ value = aws_organizations_account.audit.id }}
     print(f"   VPC baseline    : {'enabled (' + vpc_cidr + ')' if enable_vpc_baseline else 'disabled'}")
     print(f"   Account vending : {'enabled ($' + vending_budget + '/mo budget)' if enable_vending else 'disabled'}")
 
-def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None, cli_domain=None, cli_hosted_zone_id=None, cli_waf=False, cli_backend=None, cli_lambda_runtime=None, cli_http_endpoint=None):
+def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None, cli_domain=None, cli_hosted_zone_id=None, cli_waf=False, cli_backend=None, cli_lambda_runtime=None, cli_http_endpoint=None, cli_authorizer=None, cli_cognito_arns=None):
     """Generate API Gateway REST API config with per-team isolation.
 
     Architecture: Option A — shared API Gateway, per-team usage plans + API keys.
@@ -2342,6 +2342,16 @@ Each team gets:
             lambda_runtime = prompt("  Lambda runtime", default="python3.12", choices=["python3.12", "python3.11", "nodejs20.x", "nodejs18.x"])
         elif backend_type == "http":
             http_endpoint = prompt("  HTTP endpoint URL (e.g. https://backend.internal/api)")
+        print("\n  Authorization:")
+        print("    1) none     — API key only (default)")
+        print("    2) cognito  — Cognito User Pool authorizer")
+        print("    3) lambda   — Custom Lambda authorizer (token-based)")
+        auth_choice = prompt("  Authorizer type", default="none", choices=["none", "cognito", "lambda"])
+        authorizer_type = auth_choice
+        cognito_user_pool_arns = None
+        if authorizer_type == "cognito":
+            pool_arn = prompt("  Cognito User Pool ARN (or comma-separated ARNs)")
+            cognito_user_pool_arns = [a.strip() for a in pool_arn.split(",")]
         print(f"\n  How EKS pods in team '{team_name}' will consume this API:")
         print(f"    1. Mount K8s Secret with API key in namespace '{team_safe}'")
         print(f"    2. Call: https://{{api-gw-url}}/{team_safe}/{{resource}}")
@@ -2369,6 +2379,8 @@ Each team gets:
         backend_type = cli_backend or "mock"
         lambda_runtime = cli_lambda_runtime or "python3.12"
         http_endpoint = cli_http_endpoint
+        authorizer_type = cli_authorizer or "none"
+        cognito_user_pool_arns = [a.strip() for a in cli_cognito_arns.split(",")] if cli_cognito_arns else None
 
     stage_name = env
     cw_log_level = "INFO"
@@ -2513,6 +2525,8 @@ resource "aws_api_gateway_client_certificate" "this" {{
   tags        = local.tags
 }}
 
+{{authorizer_block}}
+
 # ─── Resource + Integration ─────────────────────────────────────────────────
 resource "aws_api_gateway_resource" "{resource_path}" {{
   rest_api_id = aws_api_gateway_rest_api.this.id
@@ -2644,6 +2658,16 @@ output "usage_plan_id" {{
 """
 
     # Integration block (MOCK / Lambda / HTTP)
+    # Determine authorization fields for methods
+    if authorizer_type == "cognito":
+        auth_type_field = "COGNITO_USER_POOLS"
+        auth_id_field = f"\n  authorizer_id    = aws_api_gateway_authorizer.this.id"
+    elif authorizer_type == "lambda":
+        auth_type_field = "CUSTOM"
+        auth_id_field = f"\n  authorizer_id    = aws_api_gateway_authorizer.this.id"
+    else:
+        auth_type_field = "NONE"
+        auth_id_field = ""
     if backend_type == "lambda":
         # Determine handler and filename based on runtime
         if lambda_runtime.startswith("python"):
@@ -2718,7 +2742,7 @@ resource "aws_api_gateway_method" "{resource_path}_any" {{
   rest_api_id      = aws_api_gateway_rest_api.this.id
   resource_id      = aws_api_gateway_resource.{resource_path}.id
   http_method      = "ANY"
-  authorization    = "NONE"
+  authorization    = "{auth_type_field}"{auth_id_field}
   api_key_required = true
 }}
 
@@ -2737,7 +2761,7 @@ resource "aws_api_gateway_method" "{resource_path}_any" {{
   rest_api_id      = aws_api_gateway_rest_api.this.id
   resource_id      = aws_api_gateway_resource.{resource_path}.id
   http_method      = "ANY"
-  authorization    = "NONE"
+  authorization    = "{auth_type_field}"{auth_id_field}
   api_key_required = true
 }}
 
@@ -2757,7 +2781,7 @@ resource "aws_api_gateway_method" "{resource_path}_get" {{
   rest_api_id      = aws_api_gateway_rest_api.this.id
   resource_id      = aws_api_gateway_resource.{resource_path}.id
   http_method      = "GET"
-  authorization    = "NONE"
+  authorization    = "{auth_type_field}"{auth_id_field}
   api_key_required = true
 }}
 
@@ -2790,6 +2814,119 @@ resource "aws_api_gateway_integration_response" "{resource_path}_get_200" {{
   }}
 }}
 """
+
+    # Authorizer block
+    authorizer_block = ""
+    if authorizer_type == "cognito":
+        pool_arns_tf = ", ".join([f'"{arn}"' for arn in cognito_user_pool_arns])
+        authorizer_block = f"""
+# ─── Cognito Authorizer ─────────────────────────────────────────────────────
+resource "aws_api_gateway_authorizer" "this" {{
+  name            = "{name}-cognito-auth"
+  rest_api_id     = aws_api_gateway_rest_api.this.id
+  type            = "COGNITO_USER_POOLS"
+  provider_arns   = [{pool_arns_tf}]
+  identity_source = "method.request.header.Authorization"
+}}
+"""
+    elif authorizer_type == "lambda":
+        authorizer_block = f"""
+# ─── Lambda Authorizer ──────────────────────────────────────────────────────
+resource "aws_iam_role" "authorizer_lambda" {{
+  name = "{name}-authorizer-lambda-role"
+  assume_role_policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [{{
+      Effect    = "Allow"
+      Principal = {{ Service = "lambda.amazonaws.com" }}
+      Action    = "sts:AssumeRole"
+    }}]
+  }})
+  tags = local.tags
+}}
+
+resource "aws_iam_role_policy_attachment" "authorizer_lambda_basic" {{
+  role       = aws_iam_role.authorizer_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}}
+
+data "archive_file" "authorizer" {{
+  type        = "zip"
+  source_dir  = "${{path.module}}/authorizer"
+  output_path = "${{path.module}}/authorizer.zip"
+}}
+
+resource "aws_lambda_function" "authorizer" {{
+  function_name    = "{name}-authorizer"
+  role             = aws_iam_role.authorizer_lambda.arn
+  handler          = "index.handler"
+  runtime          = "nodejs20.x"
+  filename         = data.archive_file.authorizer.output_path
+  source_code_hash = data.archive_file.authorizer.output_base64sha256
+  timeout          = 10
+  memory_size      = 128
+  tags             = local.tags
+}}
+
+resource "aws_lambda_permission" "authorizer_apigw" {{
+  statement_id  = "AllowAPIGatewayInvokeAuthorizer"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.authorizer.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${{aws_api_gateway_rest_api.this.execution_arn}}/*"
+}}
+
+resource "aws_api_gateway_authorizer" "this" {{
+  name                             = "{name}-lambda-auth"
+  rest_api_id                      = aws_api_gateway_rest_api.this.id
+  type                             = "TOKEN"
+  authorizer_uri                   = aws_lambda_function.authorizer.invoke_arn
+  authorizer_credentials           = aws_iam_role.authorizer_lambda.arn
+  identity_source                  = "method.request.header.Authorization"
+  authorizer_result_ttl_in_seconds = 300
+}}
+"""
+        # Write authorizer Lambda source
+        auth_dir = outdir / "authorizer"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        (auth_dir / "index.mjs").write_text(f'''/**
+ * Lambda Authorizer for {name}
+ * Validates Bearer token from Authorization header.
+ * Replace the token validation logic with your own (JWT, database lookup, etc.)
+ */
+export const handler = async (event) => {{
+  const token = event.authorizationToken?.replace("Bearer ", "");
+
+  if (!token) {{
+    throw new Error("Unauthorized");
+  }}
+
+  // TODO: Replace with real token validation (JWT verify, DB lookup, etc.)
+  // Example: const decoded = jwt.verify(token, process.env.JWT_SECRET);
+  const isValid = token.length > 0;
+
+  if (!isValid) {{
+    throw new Error("Unauthorized");
+  }}
+
+  // Return IAM policy
+  return {{
+    principalId: "user",
+    policyDocument: {{
+      Version: "2012-10-17",
+      Statement: [
+        {{
+          Action: "execute-api:Invoke",
+          Effect: "Allow",
+          Resource: event.methodArn,
+        }},
+      ],
+    }},
+  }};
+}};
+''')
+
+    main_tf = main_tf.replace("{authorizer_block}", authorizer_block)
 
     main_tf = main_tf.replace("{integration_block}", integration_block)
 
@@ -2997,6 +3134,11 @@ resource "aws_wafv2_web_acl_association" "api" {{
         print(f"   Backend        : HTTP proxy → {http_endpoint}/{resource_path}")
     else:
         print(f"   ⚠️  MOCK integration on /{resource_path} — replace with real backend before deploy")
+    if authorizer_type == "cognito":
+        print(f"   Authorizer     : Cognito User Pool")
+    elif authorizer_type == "lambda":
+        print(f"   Authorizer     : Lambda (token-based) → {name}-authorizer")
+        print(f"   Auth source    : {outdir}/authorizer/index.mjs")
     print(f"   Run: python3 tfc_client.py plan --dir {outdir}")
 
 
@@ -4686,7 +4828,7 @@ output "resource_group_id" {{ value = azurerm_resource_group.this.id }}
         if not args.name:
             print("ERROR: --name is required for api-gateway resource.")
             sys.exit(1)
-        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region, cli_domain=args.domain, cli_hosted_zone_id=args.hosted_zone_id, cli_waf=args.waf, cli_backend=args.backend, cli_lambda_runtime=args.lambda_runtime, cli_http_endpoint=args.http_endpoint)
+        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region, cli_domain=args.domain, cli_hosted_zone_id=args.hosted_zone_id, cli_waf=args.waf, cli_backend=args.backend, cli_lambda_runtime=args.lambda_runtime, cli_http_endpoint=args.http_endpoint, cli_authorizer=args.authorizer, cli_cognito_arns=args.cognito_arns)
 
     elif args.resource == "iam-role":
         if not args.name:
@@ -4969,6 +5111,8 @@ def main():
     p_gen.add_argument("--backend", default=None, choices=["mock", "lambda", "http"], help="API Gateway backend type")
     p_gen.add_argument("--lambda-runtime", dest="lambda_runtime", default=None, choices=["python3.12", "python3.11", "nodejs20.x", "nodejs18.x"], help="Lambda runtime (when --backend=lambda)")
     p_gen.add_argument("--http-endpoint", dest="http_endpoint", default=None, help="HTTP backend URL (when --backend=http)")
+    p_gen.add_argument("--authorizer", default=None, choices=["none", "cognito", "lambda"], help="API Gateway authorizer type")
+    p_gen.add_argument("--cognito-arns", dest="cognito_arns", default=None, help="Comma-separated Cognito User Pool ARNs (when --authorizer=cognito)")
     p_gen.add_argument("--service", default=None, help="AWS service principal for IAM role trust policy (e.g. ec2.amazonaws.com)")
     p_gen.add_argument("--policy-arn", dest="policy_arn", default=None, help="AWS managed policy ARN to attach to IAM role")
 
