@@ -10,15 +10,18 @@ Manages AWS and Azure infrastructure via Terraform Cloud (TFC). All state lives 
 ## Configuration
 
 Required env vars (set once in OpenClaw config):
+
 - `TFC_TOKEN` — Terraform Cloud **user API token** or **team API token** (not an organization token — org tokens lack permissions for plan/apply operations). Generate at: User Settings → Tokens, or Organization → Teams → Team API Token.
 - `TFC_ORG` — Terraform Cloud organization name
 - `TFC_WORKSPACE_AWS` — workspace name for AWS resources (e.g. `prod-aws`)
 - `TFC_WORKSPACE_AZURE` — workspace name for Azure resources (e.g. `prod-azure`)
 
 AWS provider credentials set as TFC workspace variables:
+
 - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
 
 Azure provider credentials set as TFC workspace variables:
+
 - `ARM_CLIENT_ID`, `ARM_CLIENT_SECRET`, `ARM_SUBSCRIPTION_ID`, `ARM_TENANT_ID`
 
 ## Workflow
@@ -32,6 +35,7 @@ User request → Generate/modify .tf files → Run plan → Show output → Wait
 ### Step 1: Understand the request
 
 Identify:
+
 - Cloud target: AWS, Azure, or both
 - Resource type and configuration
 - Whether this is create / modify / destroy
@@ -50,13 +54,25 @@ Supported resources: `s3`, `vpc`, `ec2`, `sg`, `lambda`, `iam-user`, `iam-role`,
 
 Interactive wizards (vpc, ec2, sg, lambda, iam-user, budget, cloudtrail, cloudwatch, efs, landing-zone, api-gateway) will prompt for configuration with design guidance.
 
-**API Gateway:** The `api-gateway` wizard creates a REST API with usage plan throttling (100 TPS default, burst 50), API key required on all methods, client certificate attached to the stage, CloudWatch execution logging with a dedicated log group, and developer portal metadata (private/public/allow-all). A MOCK integration is generated as a placeholder — replace it with your Lambda or HTTP backend before deploying. Plans from the `prod-aws` workspace; does not auto-apply.
+**API Gateway:** The `api-gateway` wizard creates a REST API with usage plan throttling (100 TPS default, burst 50), API key required on all methods, client certificate attached to the stage, CloudWatch execution logging with a dedicated log group, CORS preflight (OPTIONS method with Access-Control-Allow-\* headers), and developer portal metadata (private/public/allow-all). A MOCK integration is generated as a placeholder — replace it with your Lambda or HTTP backend before deploying. Plans from the `prod-aws` workspace; does not auto-apply.
 
 **API Gateway non-interactive usage (preferred):**
+
 ```bash
 python3 {baseDir}/scripts/tfc_client.py generate \
   --resource api-gateway --name my-api --workspace prod-aws
 ```
+
+**API Gateway with custom domain:**
+
+```bash
+python3 {baseDir}/scripts/tfc_client.py generate \
+  --resource api-gateway --name my-api --workspace prod-aws \
+  --domain api.example.com --hosted-zone-id Z1234567890ABC
+```
+
+When `--domain` and `--hosted-zone-id` are provided, the generator adds an ACM certificate (DNS-validated), Route53 validation records, API Gateway custom domain name (REGIONAL), base path mapping, and a Route53 A-record alias. The certificate is validated automatically via DNS.
+
 When `--name` is provided and `--dir` is omitted, the config is auto-committed to the Git repo at `$TFC_GIT_REPO_DIR/prod-aws/api-gateway-<name>/main.tf` and pushed. Always omit `--dir` for api-gateway so the generated config is persisted in Git.
 
 **VPC CIDR requirement:** The VPC and landing-zone wizards derive /24 subnets from the provided CIDR using proper network arithmetic. The CIDR must be large enough to fit the required subnets (e.g. a /16 or /21 works; a /24 only yields one subnet and will be rejected if multiple AZs are requested).
@@ -167,6 +183,7 @@ python3 {baseDir}/scripts/tfc_client.py generate \
 ```
 
 Automatic Git commits happen after:
+
 - `generate` — commits the new/updated `.tf` files
 - `plan` — commits any config changes made during plan
 - `apply` — commits post-apply state

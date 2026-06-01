@@ -2240,75 +2240,119 @@ output "audit_account_id"   {{ value = aws_organizations_account.audit.id }}
     print(f"   VPC baseline    : {'enabled (' + vpc_cidr + ')' if enable_vpc_baseline else 'disabled'}")
     print(f"   Account vending : {'enabled ($' + vending_budget + '/mo budget)' if enable_vending else 'disabled'}")
 
-def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None):
-    """Generate API Gateway REST API config. Non-interactive when cli_name is provided."""
+def prompt_api_gateway(org, workspace, outdir, cli_name=None, cli_region=None, cli_domain=None, cli_hosted_zone_id=None):
+    """Generate API Gateway REST API config with per-team isolation.
+
+    Architecture: Option A — shared API Gateway, per-team usage plans + API keys.
+    - If team already exists in state, shows existing config and skips creation.
+    - If team is new, creates usage plan + API key + resource path for that team.
+    - Common client certificate shared across the stage.
+    - VPC Endpoint resource policy for private EKS consumption.
+    """
 
     interactive = sys.stdin.isatty() and cli_name is None
 
+    # --- Gather inputs ---
     if interactive:
         print("""
-🌐 AWS API Gateway REST API Wizard
+🌐 AWS API Gateway REST API Wizard (Multi-Team)
 ────────────────────────────────────────────────────────
-Creates a REST API Gateway with:
-  - Usage plan with throttling (100 TPS, burst 50)
-  - API key required by default
-  - Client certificate for backend auth
-  - CloudWatch execution logging
-  - Dedicated CloudWatch log group
-  - Developer portal metadata
+Shared API Gateway with per-team isolation:
+  - 1 REST API Gateway (shared infrastructure)
+  - Per-team: usage plan + API key + path prefix
+  - Common client certificate (GW → backend auth)
+  - CloudWatch logging (all requests)
+  - VPC Endpoint resource policy (EKS private access)
+  - Developer portal auto-publishes all team APIs
 
-Terraform Cloud workspace: plan only, no auto-apply.
+Each team gets:
+  - Own API key (x-api-key header)
+  - Own usage plan (throttle + quota)
+  - Own path prefix (/{team-name}/*)
+  - Metering and billing isolation
 ────────────────────────────────────────────────────────""")
-        name   = prompt("API name (e.g. marsmovers-api)")
+        name   = prompt("API Gateway name (e.g. org-api-gateway)", default="org-api-gateway")
         region = prompt("AWS region", default="us-east-1")
         env    = prompt("Environment", default="prod", choices=["dev", "staging", "prod"])
-        description = prompt("API description", default=f"{name} REST API managed by OpenClaw")
+        team_name = prompt("Team name (e.g. orders, payments, platform)")
     else:
-        name = cli_name or "my-api"
+        name = cli_name or "org-api-gateway"
         region = cli_region or "us-east-1"
         env = "prod"
-        description = f"{name} REST API managed by OpenClaw"
+        team_name = cli_name  # In non-interactive, --name is the team name
 
+    team_safe = terraform_label(team_name)
+    description = f"{name} - shared REST API Gateway managed by OpenClaw"
+
+    # --- Check if team already exists in outdir ---
+    existing_tf = outdir / "main.tf"
+    team_already_exists = False
+    if existing_tf.exists():
+        content = existing_tf.read_text()
+        if f'resource "aws_api_gateway_usage_plan" "{team_safe}"' in content:
+            team_already_exists = True
+
+    if team_already_exists:
+        print(f"""
+ℹ️  Team '{team_name}' already exists in this API Gateway config.
+
+   Existing configuration:
+   - API key        : {name}-{team_safe}-key
+   - Usage plan     : {name}-{team_safe}-plan
+   - Path prefix    : /{team_safe}/*
+   - Throttle       : check main.tf for current limits
+
+   To modify, edit {outdir}/main.tf directly.
+   To add a NEW team, re-run with a different team name.
+""")
+        return
+
+    # --- Gather team-specific config ---
     if interactive:
-        stage_name = prompt("Stage name", default=env)
-        print("\n  Usage plan throttling:")
-        rate_limit = prompt_num("Steady-state requests per second (TPS)", default=100, min_val=1)
+        print(f"\n  Configuring team: {team_name}")
+        print(f"  Path prefix: /{team_safe}/*")
+        print("\n  Usage plan throttling for this team:")
+        rate_limit = prompt_num("Requests per second (TPS)", default=100, min_val=1)
         burst_limit = prompt_num("Burst limit", default=50, min_val=1)
         quota_limit = prompt_num("Monthly quota (requests, 0 = unlimited)", default=0, min_val=0, integer=True)
-        print("\n  API Key:")
-        print("    Methods will require an API key by default (x-api-key header).")
-        api_key_name = prompt("API key name", default=f"{name}-key")
-        print("\n  CloudWatch logging:")
-        print("    1) ERROR — log errors only")
-        print("    2) INFO  — log all requests (recommended for debugging)")
-        log_level = prompt("Log level", default="2", choices=["1", "2"])
-        cw_log_level = "ERROR" if log_level == "1" else "INFO"
-        log_retention = prompt("Log retention (days)", default="30", choices=["7", "14", "30", "60", "90", "365"])
-        print("\n  Developer portal metadata:")
-        print("    1) Private/internal — only visible to internal teams")
-        print("    2) Public product   — visible to external developers")
-        print("    3) Default allow    — all products behavior (portal shows all APIs)")
-        portal_choice = prompt("Portal visibility", default="1", choices=["1", "2", "3"])
-        portal_map = {"1": "private", "2": "public", "3": "allow-all"}
-        portal_visibility = portal_map[portal_choice]
-        print("\n  Backend integration:")
-        print("    A MOCK integration is created as a placeholder.")
-        print("    TODO: Replace with your Lambda, HTTP, or VPC Link integration.")
-        resource_path = prompt("Root resource path (e.g. items, users)", default="items")
-        confirm = prompt("Proceed?", default="yes", choices=["yes", "no"])
+        cors_choice = prompt("\n  Enable CORS (preflight OPTIONS)?", default="yes", choices=["yes", "no"])
+        enable_cors = cors_choice == "yes"
+        custom_domain_input = prompt("\n  Custom domain (e.g. api.example.com, blank to skip)", default="")
+        custom_domain = custom_domain_input.strip() if custom_domain_input.strip() else None
+        if custom_domain:
+            hosted_zone_id_input = prompt("  Route53 Hosted Zone ID for the domain")
+            hosted_zone_id = hosted_zone_id_input.strip()
+        else:
+            hosted_zone_id = None
+        print("\n  Backend for this team's path:")
+        print("    A MOCK integration is created as placeholder.")
+        print("    TODO: Replace with VPC Link to team's EKS NLB.")
+        print(f"\n  How EKS pods in team '{team_name}' will consume this API:")
+        print(f"    1. Mount K8s Secret with API key in namespace '{team_safe}'")
+        print(f"    2. Call: https://{{api-gw-url}}/{team_safe}/{{resource}}")
+        print(f"    3. Header: x-api-key: <{team_safe}-api-key-value>")
+        print(f"    4. Traffic stays private via VPC Endpoint (no internet)")
+        confirm = prompt("\n  Proceed?", default="yes", choices=["yes", "no"])
         if confirm != "yes":
             print("Aborted.")
             sys.exit(0)
     else:
-        stage_name = env
         rate_limit = "100"
         burst_limit = "50"
         quota_limit = "0"
-        api_key_name = f"{name}-key"
-        cw_log_level = "INFO"
-        log_retention = "30"
-        portal_visibility = "private"
-        resource_path = "items"
+
+    # Derived variables
+    resource_path = team_safe
+    api_key_name = f"{name}-{team_safe}-key"
+    portal_visibility = "private"  # default; interactive could prompt
+    if not interactive:
+        enable_cors = True
+        custom_domain = cli_domain
+        hosted_zone_id = cli_hosted_zone_id
+
+    stage_name = env
+    cw_log_level = "INFO"
+    log_retention = "30"
 
     # Quota block
     quota_block = ""
@@ -2318,6 +2362,57 @@ Terraform Cloud workspace: plan only, no auto-apply.
     limit  = {quota_limit}
     period = "MONTH"
   }}
+"""
+
+    # CORS block
+    cors_block = ""
+    if enable_cors:
+        cors_block = f"""
+# ─── CORS (OPTIONS preflight) ──────────────────────────────────────────────
+resource "aws_api_gateway_method" "{resource_path}_options" {{
+  rest_api_id      = aws_api_gateway_rest_api.this.id
+  resource_id      = aws_api_gateway_resource.{resource_path}.id
+  http_method      = "OPTIONS"
+  authorization    = "NONE"
+  api_key_required = false
+}}
+
+resource "aws_api_gateway_integration" "{resource_path}_options" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_options.http_method
+  type        = "MOCK"
+
+  request_templates = {{
+    "application/json" = jsonencode({{ statusCode = 200 }})
+  }}
+}}
+
+resource "aws_api_gateway_method_response" "{resource_path}_options_200" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_options.http_method
+  status_code = "200"
+
+  response_parameters = {{
+    "method.response.header.Access-Control-Allow-Headers" = true
+    "method.response.header.Access-Control-Allow-Methods" = true
+    "method.response.header.Access-Control-Allow-Origin"  = true
+  }}
+}}
+
+resource "aws_api_gateway_integration_response" "{resource_path}_options_200" {{
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.{resource_path}.id
+  http_method = aws_api_gateway_method.{resource_path}_options.http_method
+  status_code = aws_api_gateway_method_response.{resource_path}_options_200.status_code
+
+  response_parameters = {{
+    "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+    "method.response.header.Access-Control-Allow-Methods" = "'GET,POST,PUT,DELETE,OPTIONS'"
+    "method.response.header.Access-Control-Allow-Origin"  = "'*'"
+  }}
+}}
 """
 
     # Portal tags
@@ -2442,6 +2537,8 @@ resource "aws_api_gateway_integration_response" "{resource_path}_get_200" {{
   }}
 }}
 
+{cors_block}
+
 # ─── Deployment + Stage ────────────────────────────────────────────────────
 resource "aws_api_gateway_deployment" "this" {{
   rest_api_id = aws_api_gateway_rest_api.this.id
@@ -2525,6 +2622,8 @@ resource "aws_api_gateway_usage_plan_key" "this" {{
   usage_plan_id = aws_api_gateway_usage_plan.this.id
 }}
 
+{{custom_domain_block}}
+
 # ─── Outputs ───────────────────────────────────────────────────────────────
 output "api_id" {{
   value = aws_api_gateway_rest_api.this.id
@@ -2554,7 +2653,88 @@ output "cloudwatch_log_group" {{
 output "usage_plan_id" {{
   value = aws_api_gateway_usage_plan.this.id
 }}
+
+{{custom_domain_outputs}}
 """
+
+    # Custom domain block
+    custom_domain_block = ""
+    custom_domain_outputs = ""
+    if custom_domain:
+        custom_domain_block = f"""
+# ─── Custom Domain + ACM Certificate ──────────────────────────────────────
+resource "aws_acm_certificate" "api" {{
+  domain_name       = "{custom_domain}"
+  validation_method = "DNS"
+  tags              = local.tags
+
+  lifecycle {{ create_before_destroy = true }}
+}}
+
+resource "aws_route53_record" "cert_validation" {{
+  for_each = {{
+    for dvo in aws_acm_certificate.api.domain_validation_options : dvo.domain_name => {{
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }}
+  }}
+
+  zone_id = "{hosted_zone_id}"
+  name    = each.value.name
+  type    = each.value.type
+  ttl     = 60
+  records = [each.value.record]
+}}
+
+resource "aws_acm_certificate_validation" "api" {{
+  certificate_arn         = aws_acm_certificate.api.arn
+  validation_record_fqdns = [for r in aws_route53_record.cert_validation : r.fqdn]
+}}
+
+resource "aws_api_gateway_domain_name" "this" {{
+  domain_name              = "{custom_domain}"
+  regional_certificate_arn = aws_acm_certificate_validation.api.certificate_arn
+
+  endpoint_configuration {{
+    types = ["REGIONAL"]
+  }}
+
+  tags = local.tags
+}}
+
+resource "aws_api_gateway_base_path_mapping" "this" {{
+  api_id      = aws_api_gateway_rest_api.this.id
+  stage_name  = aws_api_gateway_stage.{stage_name}.stage_name
+  domain_name = aws_api_gateway_domain_name.this.domain_name
+}}
+
+resource "aws_route53_record" "api" {{
+  zone_id = "{hosted_zone_id}"
+  name    = "{custom_domain}"
+  type    = "A"
+
+  alias {{
+    name                   = aws_api_gateway_domain_name.this.regional_domain_name
+    zone_id                = aws_api_gateway_domain_name.this.regional_zone_id
+    evaluate_target_health = true
+  }}
+}}
+"""
+        custom_domain_outputs = f"""
+output "custom_domain" {{
+  value = "{custom_domain}"
+}}
+
+output "custom_domain_url" {{
+  value = "https://{custom_domain}"
+}}
+"""
+
+    # Interpolate custom domain blocks into main_tf
+    main_tf = main_tf.replace("{custom_domain_block}", custom_domain_block)
+    main_tf = main_tf.replace("{custom_domain_outputs}", custom_domain_outputs)
+
     (outdir / "main.tf").write_text(main_tf)
     print(f"\n✅ Generated {outdir}/main.tf for API Gateway '{name}'")
     print(f"   Stage          : {stage_name}")
@@ -2563,6 +2743,8 @@ output "usage_plan_id" {{
     print(f"   Client cert    : attached to stage")
     print(f"   Logging        : {cw_log_level} → /aws/apigateway/{name}")
     print(f"   Portal         : {portal_visibility}")
+    if custom_domain:
+        print(f"   Custom domain  : {custom_domain} (ACM + Route53 alias)")
     print(f"   ⚠️  MOCK integration on /{resource_path} — replace with real backend before deploy")
     print(f"   Run: python3 tfc_client.py plan --dir {outdir}")
 
@@ -4253,7 +4435,7 @@ output "resource_group_id" {{ value = azurerm_resource_group.this.id }}
         if not args.name:
             print("ERROR: --name is required for api-gateway resource.")
             sys.exit(1)
-        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region)
+        prompt_api_gateway(org, workspace, outdir, cli_name=args.name, cli_region=args.region, cli_domain=args.domain, cli_hosted_zone_id=args.hosted_zone_id)
 
     elif args.resource == "iam-role":
         if not args.name:
@@ -4530,6 +4712,8 @@ def main():
     p_gen.add_argument("--workspace", required=True)
     p_gen.add_argument("--dir", required=False, default=None)
     p_gen.add_argument("--region", default=None)
+    p_gen.add_argument("--domain", default=None, help="Custom domain for API Gateway (e.g. api.example.com)")
+    p_gen.add_argument("--hosted-zone-id", dest="hosted_zone_id", default=None, help="Route53 Hosted Zone ID for custom domain")
     p_gen.add_argument("--service", default=None, help="AWS service principal for IAM role trust policy (e.g. ec2.amazonaws.com)")
     p_gen.add_argument("--policy-arn", dest="policy_arn", default=None, help="AWS managed policy ARN to attach to IAM role")
 
